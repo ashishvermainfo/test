@@ -1,60 +1,52 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
-const { GoogleAuth } = require('google-auth-library');
-const app = express();
+const { Firestore } = require('@google-cloud/firestore');
 
 dotenv.config();
+
+const app = express();
 app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.PROJECT_ID,
-  private_key: process.env.PRIVATE_KEY.replace(/\\n/g, '\n'), // Replace escaped newlines
-  client_email: process.env.CLIENT_EMAIL,
-};
+const firestore = new Firestore({
+  projectId: process.env.FIRESTORE_PROJECT_ID,
+  credentials: {
+    type: 'service_account',
+    project_id: process.env.FIRESTORE_PROJECT_ID,
+    client_email: process.env.FIRESTORE_CLIENT_EMAIL,
+    private_key: process.env.FIRESTORE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  },
+});
 
-const serviceAccount2 = {
-  type: "service_account",
-  project_id: process.env.PROJECT_ID2,
-  private_key: process.env.PRIVATE_KEY2.replace(/\\n/g, '\n'), // Replace escaped newlines
-  client_email: process.env.CLIENT_EMAIL2,
-};
-
-app.get('/generate-token', async (req, res) => {
+app.post('/webhook', async (req, res) => {
   try {
-    const auth = new GoogleAuth({
-      credentials: serviceAccount,
-      scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
-    });
+    const webhookData = req.body;
 
-    const client = await auth.getClient();
-    const token = await client.getAccessToken();
+    const phoneNo = String(webhookData.phone_no || '').replace(/\D+/g, '');
+    const smsTo = String(webhookData.sms_to || '').trim();
+    const smsBody = String(webhookData.sms_body || '').trim();
 
-    res.json({ token: token.token });
+    if (phoneNo && smsTo && smsBody) {
+      await firestore.collection('users').doc(phoneNo).collection('sendmsg').doc('send').set({
+        SmsBody: smsBody,
+        SmsTo: smsTo,
+        send: 'yes',
+      });
+    }
+
+    res.status(200).send('Webhook processed successfully');
   } catch (error) {
-    console.error('Error generating Bearer Token:', error.message);
-    res.status(500).json({ error: 'Failed to generate Bearer Token' });
+    res.status(200).send('Internal Server Error');
   }
 });
 
-app.get('/generate-token-agent', async (req, res) => {
-  try {
-    const auth = new GoogleAuth({
-      credentials: serviceAccount2,
-      scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
-    });
-
-    const client = await auth.getClient();
-    const token = await client.getAccessToken();
-
-    res.json({ token: token.token });
-  } catch (error) {
-    console.error('Error generating Bearer Token:', error.message);
-    res.status(500).json({ error: 'Failed to generate Bearer Token' });
-  }
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-app.listen(3000, () => {
-  console.log('Server is running on http://localhost:3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('Server is running on http://localhost:' + PORT);
 });
