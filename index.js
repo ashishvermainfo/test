@@ -36,9 +36,16 @@ app.post('/webhook', async (req, res) => {
       });
     }
 
-    res.status(200).send('Webhook processed successfully');
+    return res.status(200).json({
+      success: true,
+      message: 'Webhook processed successfully'
+    });
   } catch (error) {
-    res.status(200).send('Internal Server Error');
+    return res.status(200).json({
+      success: false,
+      message: 'Internal Server Error',
+      error: error.message
+    });
   }
 });
 
