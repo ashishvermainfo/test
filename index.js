@@ -49,6 +49,28 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ALTCHA Challenge
+app.get('/challenge', async (req, res) => {
+  try {
+    const response = await fetch('https://altcha-api.xbees.in/v1/challenge', {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0',
+      },
+    });
+
+    const data = await response.json();
+
+    return res.status(response.status).json(data);
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
 });
