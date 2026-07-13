@@ -1,6 +1,7 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
+const crypto = require('crypto');
 const { Firestore } = require('@google-cloud/firestore');
 
 dotenv.config();
@@ -49,7 +50,44 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ALTCHA Challenge
+/** Solve ALTCHA: find n where hash(salt + n) === challenge */
+function solveAltcha(data) {
+  const challenge = String(data.challenge || '');
+  const salt = String(data.salt || '');
+  const max = Number(data.maxnumber) > 0 ? Number(data.maxnumber) : 100000;
+  const algoRaw = String(data.algorithm || 'SHA-256').toUpperCase();
+  const algo = algoRaw === 'SHA-1' ? 'sha1' : (algoRaw === 'SHA-512' ? 'sha512' : 'sha256');
+
+  const start = Date.now();
+  let number = null;
+  for (let n = 0; n <= max; n++) {
+    const hash = crypto.createHash(algo).update(salt + String(n)).digest('hex');
+    if (hash === challenge) {
+      number = n;
+      break;
+    }
+  }
+  if (number === null) {
+    throw new Error('Could not solve challenge within maxnumber=' + max);
+  }
+
+  const took = Math.max(1, Date.now() - start);
+  const payload = {
+    algorithm: data.algorithm || 'SHA-256',
+    challenge,
+    number,
+    salt,
+    signature: data.signature || '',
+    took,
+  };
+
+  return {
+    payload,
+    token: Buffer.from(JSON.stringify(payload)).toString('base64'),
+  };
+}
+
+// ALTCHA: fetch challenge → solve → return token
 app.get('/challenge', async (req, res) => {
   try {
     const response = await fetch('https://altcha-api.xbees.in/v1/challenge', {
@@ -61,8 +99,23 @@ app.get('/challenge', async (req, res) => {
     });
 
     const data = await response.json();
+    if (!response.ok) {
+      return res.status(response.status).json(data);
+    }
+    if (!data || !data.challenge || !data.salt) {
+      return res.status(502).json({ success: false, error: 'Invalid challenge response', data });
+    }
 
-    return res.status(response.status).json(data);
+    const solved = solveAltcha(data);
+
+    return res.status(200).json({
+      success: true,
+      token: solved.token,
+      number: solved.payload.number,
+      took: solved.payload.took,
+      payload: solved.payload,
+      challenge: data,
+    });
   } catch (err) {
     return res.status(500).json({
       success: false,
