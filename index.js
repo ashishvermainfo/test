@@ -97,6 +97,45 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
+/**
+ * Store chat message → Firestore
+ * POST /storechat
+ * body: { doc_id|firestore_doc_id, history_id, msg, url, send_id, send_type, date_time|created_at }
+ * path: app_chat/{docId}/chat/{history_id}
+ */
+app.post('/storechat', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const docId = String(b.doc_id || b.firestore_doc_id || b.docId || '').trim();
+    const historyId = b.history_id != null ? Number(b.history_id) : NaN;
+    if (!docId || !Number.isFinite(historyId) || historyId <= 0) {
+      return res.status(400).json({ success: false, message: 'doc_id and history_id required' });
+    }
+
+    const dt = String(b.date_time || b.created_at || b.updated_at || '').trim();
+    const row = {
+      history_id: historyId,
+      msg: b.msg != null ? String(b.msg) : '',
+      url: b.url != null ? String(b.url) : '',
+      send_id: String(b.send_id != null ? b.send_id : ''),
+      send_type: b.send_type != null ? String(b.send_type) : 'admin',
+      date_time: dt,
+    };
+    if (dt) {
+      row.created_at = dt;
+      row.updated_at = dt;
+    }
+
+    const hid = String(historyId);
+    await firestore.collection('app_chat').doc(docId).collection('chat').doc(hid).set(row, { merge: true });
+
+    return res.status(200).json({ success: true, doc_id: docId, history_id: historyId });
+  } catch (error) {
+    console.error('[storechat] error', error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // memory mein last historyId (Firebase nahi)
 let lastHistoryId = '';
 
