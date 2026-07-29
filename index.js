@@ -267,9 +267,20 @@ app.post('/gmailwebhook', async (req, res) => {
       walkAtt(msg.payload);
 
       const from = hdr('From');
+      const to = hdr('To');
+      const subject = hdr('Subject') || '(no subject)';
       const labels = Array.isArray(msg.labelIds) ? msg.labelIds : [];
-      const isOut = labels.includes('SENT') || from.toLowerCase().includes(MY_EMAIL.toLowerCase());
+      const fromLow = from.toLowerCase();
+      const skipCheck = (from + ' ' + subject + ' ' + to).toLowerCase();
+
+      // Outbound / own mailbox — restinfoot API pe mat bhejo
+      const isOut =
+        labels.includes('SENT') ||
+        fromLow.includes(MY_EMAIL.toLowerCase());
       if (isOut) continue;
+
+      // Razorpay mails — restinfoot API pe mat bhejo
+      if (skipCheck.includes('razorpay')) continue;
 
       const d = new Date(msg.internalDate ? Number(msg.internalDate) : Date.now());
       const pad = (n) => String(n).padStart(2, '0');
@@ -291,10 +302,10 @@ app.post('/gmailwebhook', async (req, res) => {
         msg_id: String(msg.id || ''),
         rfc_message_id: hdr('Message-ID'),
         mail_from: from,
-        mail_to: hdr('To'),
+        mail_to: to,
         mail_cc: hdr('Cc'),
         mail_bcc: hdr('Bcc'),
-        subject: hdr('Subject') || '(no subject)',
+        subject,
         body,
         direction: 'in',
         mail_type: 'reply',
@@ -309,30 +320,37 @@ app.post('/gmailwebhook', async (req, res) => {
       return res.status(200).json({ success: true, message: 'no inbound', historyId: newestHistoryId });
     }
 
-    // 6) restinfoot webhook — iske baad hi response
-    const wpRes = await fetch(WP_HOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        source: 'node-gmail',
-        emailAddress,
-        historyId: newestHistoryId,
-        messages,
-      }),
-    });
-    const wpText = await wpRes.text();
+    // 6) restinfoot webhook — fail ho to bhi Pub/Sub ko 200
+    let wpStatus = 0;
     let wpData = null;
     try {
-      wpData = wpText ? JSON.parse(wpText) : null;
-    } catch (_) {
-      wpData = { raw: wpText };
+      const wpRes = await fetch(WP_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          source: 'node-gmail',
+          emailAddress,
+          historyId: newestHistoryId,
+          messages,
+        }),
+      });
+      wpStatus = wpRes.status;
+      const wpText = await wpRes.text();
+      try {
+        wpData = wpText ? JSON.parse(wpText) : null;
+      } catch (_) {
+        wpData = { raw: wpText };
+      }
+    } catch (wpErr) {
+      console.error('[gmailwebhook] wp hook error', wpErr.message);
+      wpData = { success: false, message: wpErr.message };
     }
 
     return res.status(200).json({
       success: true,
       count: messages.length,
       historyId: newestHistoryId,
-      wp_status: wpRes.status,
+      wp_status: wpStatus,
       wp: wpData,
     });
   } catch (err) {
