@@ -168,15 +168,13 @@ async function delhiveryFetchAwb(awb) {
 }
 
 /**
- * Cron → received → Delhivery API → WP webhook
- * Vercel: setImmediate mat use karo (kill ho jata hai) — await same request mein.
- * POST /dehlivery_tracking  body: { orders: [ { order_id, awb: [] } ] }
+ * Cron → Delhivery API → WP webhook → phir response
+ * Vercel: res.json() KE BAAD code kill ho sakta hai — pehle kaam, phir response.
  */
 app.post('/dehlivery_tracking', async (req, res) => {
   const body = req.body || {};
   const ordersIn = Array.isArray(body.orders) ? body.orders : [];
   const type = String(body.type || 'b2c');
-  res.status(200).json({ success: true, message: 'received', count: ordersIn.length, type });
 
   try {
     console.log('[dehlivery_tracking] start', type, 'orders=', ordersIn.length);
@@ -205,19 +203,31 @@ app.post('/dehlivery_tracking', async (req, res) => {
       }
       out.push({ order_id: orderId, awbs: awbResults });
     }
-    if (!out.length) {
-      console.log('[dehlivery_tracking] nothing to send');
-      return;
+
+    let wpStatus = 0;
+    let wpBody = '';
+    if (out.length) {
+      const wpRes = await fetch(WP_DELHIVERY_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out, type }),
+      });
+      wpStatus = wpRes.status;
+      wpBody = (await wpRes.text()).slice(0, 300);
+      console.log('[dehlivery_tracking]', type, 'wp', wpStatus, wpBody);
     }
 
-    const wpRes = await fetch(WP_DELHIVERY_HOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ orders: out, type }),
+    return res.status(200).json({
+      success: true,
+      message: 'done',
+      count: ordersIn.length,
+      tracked: out.length,
+      type,
+      wp_status: wpStatus,
     });
-    console.log('[dehlivery_tracking]', type, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
   } catch (err) {
     console.error('[dehlivery_tracking] error', err.message);
+    return res.status(200).json({ success: false, message: err.message, type });
   }
 });
 
@@ -300,7 +310,6 @@ async function amazonFetchAwb(awb) {
 
 app.post('/amazon-tracking', async (req, res) => {
   const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
-  res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
 
   try {
     console.log('[amazon-tracking] start orders=', ordersIn.length);
@@ -323,19 +332,28 @@ app.post('/amazon-tracking', async (req, res) => {
       }
       out.push({ order_id: orderId, awbs: awbResults });
     }
-    if (!out.length) {
-      console.log('[amazon-tracking] nothing to send');
-      return;
+
+    let wpStatus = 0;
+    if (out.length) {
+      const wpRes = await fetch(WP_AMAZON_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out }),
+      });
+      wpStatus = wpRes.status;
+      console.log('[amazon-tracking] wp', wpStatus, (await wpRes.text()).slice(0, 300));
     }
 
-    const wpRes = await fetch(WP_AMAZON_HOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ orders: out }),
+    return res.status(200).json({
+      success: true,
+      message: 'done',
+      count: ordersIn.length,
+      tracked: out.length,
+      wp_status: wpStatus,
     });
-    console.log('[amazon-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
   } catch (err) {
     console.error('[amazon-tracking] error', err.message);
+    return res.status(200).json({ success: false, message: err.message });
   }
 });
 
@@ -371,19 +389,14 @@ async function xpressbeeFetchAwb(awb, token) {
 
 app.post('/xpressbee-tracking', async (req, res) => {
   const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
-  res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
 
   try {
     console.log('[xpressbee-tracking] start orders=', ordersIn.length);
-    let token = '';
-    try {
-      const ch = await solveAltchaToken();
-      token = String(ch.token || '');
-    } catch (e) {
-      console.error('[xpressbee-tracking] token error', e.message);
-      return;
+    const ch = await solveAltchaToken();
+    const token = String(ch.token || '');
+    if (!token) {
+      return res.status(200).json({ success: false, message: 'no altcha token' });
     }
-    if (!token) return;
 
     const out = [];
     for (const row of ordersIn) {
@@ -404,19 +417,28 @@ app.post('/xpressbee-tracking', async (req, res) => {
       }
       out.push({ order_id: orderId, awbs: awbResults });
     }
-    if (!out.length) {
-      console.log('[xpressbee-tracking] nothing to send');
-      return;
+
+    let wpStatus = 0;
+    if (out.length) {
+      const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out }),
+      });
+      wpStatus = wpRes.status;
+      console.log('[xpressbee-tracking] wp', wpStatus, (await wpRes.text()).slice(0, 300));
     }
 
-    const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ orders: out }),
+    return res.status(200).json({
+      success: true,
+      message: 'done',
+      count: ordersIn.length,
+      tracked: out.length,
+      wp_status: wpStatus,
     });
-    console.log('[xpressbee-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
   } catch (err) {
     console.error('[xpressbee-tracking] error', err.message);
+    return res.status(200).json({ success: false, message: err.message });
   }
 });
 
