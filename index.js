@@ -235,6 +235,31 @@ const WP_AMAZON_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/amazon_trackin
 const WP_XPRESSBEE_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/xpressbee_tracking';
 
 /** Same as appcron copy amazon_api_get_tracker_status → status + edd */
+function amazonParseJsonMaybe(val) {
+  if (val == null) return null;
+  if (typeof val === 'object') return val;
+  if (typeof val === 'string') {
+    try {
+      return JSON.parse(val);
+    } catch (_) {
+      return null;
+    }
+  }
+  return null;
+}
+
+function amazonPickEddFromMeta(meta) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return '';
+  // expectedDeliveryDate first, else promisedDeliveryDate (same as PHP)
+  const expected = String(
+    (meta.expectedDeliveryDate && (meta.expectedDeliveryDate.date || meta.expectedDeliveryDate.dateString)) || ''
+  ).trim();
+  if (expected) return expected;
+  return String(
+    (meta.promisedDeliveryDate && (meta.promisedDeliveryDate.date || meta.promisedDeliveryDate.dateString)) || ''
+  ).trim();
+}
+
 async function amazonFetchAwb(awb) {
   const url = 'https://track.amazon.in/api/tracker/' + encodeURIComponent(awb);
   const res = await fetch(url, {
@@ -250,14 +275,7 @@ async function amazonFetchAwb(awb) {
     return { awb, status: '', edd: '', error: 'Invalid response' };
   }
 
-  let eventHistory = null;
-  try {
-    eventHistory = typeof data.eventHistory === 'string'
-      ? JSON.parse(data.eventHistory)
-      : data.eventHistory;
-  } catch (_) {
-    return { awb, status: '', edd: '', error: 'Could not parse eventHistory' };
-  }
+  const eventHistory = amazonParseJsonMaybe(data.eventHistory);
   if (!eventHistory || typeof eventHistory !== 'object') {
     return { awb, status: '', edd: '', error: 'Could not parse eventHistory' };
   }
@@ -265,34 +283,27 @@ async function amazonFetchAwb(awb) {
   const summaryStatus = String((eventHistory.summary && eventHistory.summary.status) || '').trim();
   const events = Array.isArray(eventHistory.eventHistory) ? eventHistory.eventHistory : [];
 
-  let promised = '';
-  let progress = null;
-  try {
-    if (data.progressTracker != null) {
-      progress = typeof data.progressTracker === 'string'
-        ? JSON.parse(data.progressTracker)
-        : data.progressTracker;
-    }
-  } catch (_) {
-    progress = null;
+  // EDD: progressTracker.summary.metadata OR eventHistory.summary.metadata
+  // NOTE: metadata is OBJECT (not array) — PHP is_array() true for assoc, JS Array.isArray false
+  let progress = amazonParseJsonMaybe(data.progressTracker);
+  if (!progress) {
+    progress = amazonParseJsonMaybe(eventHistory.progressTracker);
   }
-  if (!progress && eventHistory.progressTracker) progress = eventHistory.progressTracker;
 
+  let promised = '';
   const metaBlocks = [];
-  if (progress && progress.summary && Array.isArray(progress.summary.metadata)) {
+  if (progress && progress.summary && progress.summary.metadata && typeof progress.summary.metadata === 'object') {
     metaBlocks.push(progress.summary.metadata);
   }
-  if (eventHistory.summary && Array.isArray(eventHistory.summary.metadata)) {
+  if (eventHistory.summary && eventHistory.summary.metadata && typeof eventHistory.summary.metadata === 'object') {
     metaBlocks.push(eventHistory.summary.metadata);
   }
   for (const meta of metaBlocks) {
-    const expected = String((meta.expectedDeliveryDate && meta.expectedDeliveryDate.date) || '').trim();
-    if (expected) {
-      promised = expected;
+    const edd = amazonPickEddFromMeta(meta);
+    if (edd) {
+      promised = edd;
       break;
     }
-    const fallback = String((meta.promisedDeliveryDate && meta.promisedDeliveryDate.date) || '').trim();
-    if (fallback && !promised) promised = fallback;
   }
 
   let resolved = summaryStatus;
