@@ -168,54 +168,57 @@ async function delhiveryFetchAwb(awb) {
 }
 
 /**
- * Cron → turant received → Delhivery status+tracking_states+edd → WP webhook
+ * Cron → received → Delhivery API → WP webhook
+ * Vercel: setImmediate mat use karo (kill ho jata hai) — await same request mein.
  * POST /dehlivery_tracking  body: { orders: [ { order_id, awb: [] } ] }
  */
-app.post('/dehlivery_tracking', (req, res) => {
+app.post('/dehlivery_tracking', async (req, res) => {
   const body = req.body || {};
   const ordersIn = Array.isArray(body.orders) ? body.orders : [];
   const type = String(body.type || 'b2c');
   res.status(200).json({ success: true, message: 'received', count: ordersIn.length, type });
 
-  setImmediate(async () => {
-    try {
-      const out = [];
-      for (const row of ordersIn) {
-        if (!row || typeof row !== 'object') continue;
-        const orderId = Number(row.order_id || 0);
-        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-        if (!orderId || !awbs.length) continue;
+  try {
+    console.log('[dehlivery_tracking] start', type, 'orders=', ordersIn.length);
+    const out = [];
+    for (const row of ordersIn) {
+      if (!row || typeof row !== 'object') continue;
+      const orderId = Number(row.order_id || 0);
+      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+      if (!orderId || !awbs.length) continue;
 
-        const awbResults = [];
-        for (const awb of awbs) {
-          try {
-            awbResults.push(await delhiveryFetchAwb(awb));
-          } catch (e) {
-            awbResults.push({
-              awb,
-              status: '',
-              tracking_states: [],
-              edd: '',
-              error: e.message || 'fetch failed',
-            });
-          }
-          await new Promise((r) => setTimeout(r, 200));
+      const awbResults = [];
+      for (const awb of awbs) {
+        try {
+          awbResults.push(await delhiveryFetchAwb(awb));
+        } catch (e) {
+          awbResults.push({
+            awb,
+            status: '',
+            tracking_states: [],
+            edd: '',
+            error: e.message || 'fetch failed',
+          });
         }
-        out.push({ order_id: orderId, awbs: awbResults });
+        await new Promise((r) => setTimeout(r, 200));
       }
-      if (!out.length) return;
-
-      const wpRes = await fetch(WP_DELHIVERY_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out, type }),
-      });
-      console.log('[dehlivery_tracking]', type, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
-    } catch (err) {
-      console.error('[dehlivery_tracking] error', err.message);
+      out.push({ order_id: orderId, awbs: awbResults });
     }
-  });
+    if (!out.length) {
+      console.log('[dehlivery_tracking] nothing to send');
+      return;
+    }
+
+    const wpRes = await fetch(WP_DELHIVERY_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ orders: out, type }),
+    });
+    console.log('[dehlivery_tracking]', type, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+  } catch (err) {
+    console.error('[dehlivery_tracking] error', err.message);
+  }
 });
 
 const WP_AMAZON_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
@@ -295,43 +298,45 @@ async function amazonFetchAwb(awb) {
   return { awb, status: resolved, edd: promised };
 }
 
-app.post('/amazon-tracking', (req, res) => {
+app.post('/amazon-tracking', async (req, res) => {
   const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
   res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
 
-  setImmediate(async () => {
-    try {
-      const out = [];
-      for (const row of ordersIn) {
-        if (!row || typeof row !== 'object') continue;
-        const orderId = Number(row.order_id || 0);
-        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-        if (!orderId || !awbs.length) continue;
+  try {
+    console.log('[amazon-tracking] start orders=', ordersIn.length);
+    const out = [];
+    for (const row of ordersIn) {
+      if (!row || typeof row !== 'object') continue;
+      const orderId = Number(row.order_id || 0);
+      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+      if (!orderId || !awbs.length) continue;
 
-        const awbResults = [];
-        for (const awb of awbs) {
-          try {
-            awbResults.push(await amazonFetchAwb(awb));
-          } catch (e) {
-            awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
-          }
-          await new Promise((r) => setTimeout(r, 200));
+      const awbResults = [];
+      for (const awb of awbs) {
+        try {
+          awbResults.push(await amazonFetchAwb(awb));
+        } catch (e) {
+          awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
         }
-        out.push({ order_id: orderId, awbs: awbResults });
+        await new Promise((r) => setTimeout(r, 200));
       }
-      if (!out.length) return;
-
-      const wpRes = await fetch(WP_AMAZON_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out }),
-      });
-      console.log('[amazon-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
-    } catch (err) {
-      console.error('[amazon-tracking] error', err.message);
+      out.push({ order_id: orderId, awbs: awbResults });
     }
-  });
+    if (!out.length) {
+      console.log('[amazon-tracking] nothing to send');
+      return;
+    }
+
+    const wpRes = await fetch(WP_AMAZON_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ orders: out }),
+    });
+    console.log('[amazon-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+  } catch (err) {
+    console.error('[amazon-tracking] error', err.message);
+  }
 });
 
 /** Same as appcron copy xpressbee_api → status + edd */
@@ -364,53 +369,55 @@ async function xpressbeeFetchAwb(awb, token) {
   return { awb, status, edd };
 }
 
-app.post('/xpressbee-tracking', (req, res) => {
+app.post('/xpressbee-tracking', async (req, res) => {
   const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
   res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
 
-  setImmediate(async () => {
+  try {
+    console.log('[xpressbee-tracking] start orders=', ordersIn.length);
+    let token = '';
     try {
-      let token = '';
-      try {
-        const ch = await solveAltchaToken();
-        token = String(ch.token || '');
-      } catch (e) {
-        console.error('[xpressbee-tracking] token error', e.message);
-        return;
-      }
-      if (!token) return;
-
-      const out = [];
-      for (const row of ordersIn) {
-        if (!row || typeof row !== 'object') continue;
-        const orderId = Number(row.order_id || 0);
-        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-        if (!orderId || !awbs.length) continue;
-
-        const awbResults = [];
-        for (const awb of awbs) {
-          try {
-            awbResults.push(await xpressbeeFetchAwb(awb, token));
-          } catch (e) {
-            awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
-          }
-          await new Promise((r) => setTimeout(r, 200));
-        }
-        out.push({ order_id: orderId, awbs: awbResults });
-      }
-      if (!out.length) return;
-
-      const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out }),
-      });
-      console.log('[xpressbee-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
-    } catch (err) {
-      console.error('[xpressbee-tracking] error', err.message);
+      const ch = await solveAltchaToken();
+      token = String(ch.token || '');
+    } catch (e) {
+      console.error('[xpressbee-tracking] token error', e.message);
+      return;
     }
-  });
+    if (!token) return;
+
+    const out = [];
+    for (const row of ordersIn) {
+      if (!row || typeof row !== 'object') continue;
+      const orderId = Number(row.order_id || 0);
+      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+      if (!orderId || !awbs.length) continue;
+
+      const awbResults = [];
+      for (const awb of awbs) {
+        try {
+          awbResults.push(await xpressbeeFetchAwb(awb, token));
+        } catch (e) {
+          awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      out.push({ order_id: orderId, awbs: awbResults });
+    }
+    if (!out.length) {
+      console.log('[xpressbee-tracking] nothing to send');
+      return;
+    }
+
+    const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ orders: out }),
+    });
+    console.log('[xpressbee-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+  } catch (err) {
+    console.error('[xpressbee-tracking] error', err.message);
+  }
 });
 
 // memory mein last historyId (Firebase nahi)
