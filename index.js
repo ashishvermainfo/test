@@ -48,50 +48,59 @@ app.post('/webhook', async (req, res) => {
 
 app.get('/challenge', async (req, res) => {
   try {
-    const response = await fetch('https://altcha-api.xbees.in/v1/challenge', {
-      method: 'GET',
-      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
-    });
-    const data = await response.json();
-    if (!response.ok) return res.status(response.status).json(data);
-    if (!data || !data.challenge || !data.salt) {
-      return res.status(502).json({ success: false, error: 'Invalid challenge response', data });
-    }
-
-    const challenge = String(data.challenge);
-    const salt = String(data.salt);
-    const max = Number(data.maxnumber) > 0 ? Number(data.maxnumber) : 100000;
-    const algoRaw = String(data.algorithm || 'SHA-256').toUpperCase();
-    const algo = algoRaw === 'SHA-1' ? 'sha1' : algoRaw === 'SHA-512' ? 'sha512' : 'sha256';
-    const start = Date.now();
-    let number = null;
-    for (let n = 0; n <= max; n++) {
-      if (crypto.createHash(algo).update(salt + String(n)).digest('hex') === challenge) {
-        number = n;
-        break;
-      }
-    }
-    if (number === null) throw new Error('Could not solve challenge');
-    const payload = {
-      algorithm: data.algorithm || 'SHA-256',
-      challenge,
-      number,
-      salt,
-      signature: data.signature || '',
-      took: Math.max(1, Date.now() - start),
-    };
-    return res.status(200).json({
-      success: true,
-      token: Buffer.from(JSON.stringify(payload)).toString('base64'),
-      number: payload.number,
-      took: payload.took,
-      payload,
-      challenge: data,
-    });
+    const out = await solveAltchaToken();
+    return res.status(200).json(out);
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
+
+async function solveAltchaToken() {
+  const response = await fetch('https://altcha-api.xbees.in/v1/challenge', {
+    method: 'GET',
+    headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const err = new Error('Challenge HTTP ' + response.status);
+    err.data = data;
+    throw err;
+  }
+  if (!data || !data.challenge || !data.salt) {
+    throw new Error('Invalid challenge response');
+  }
+
+  const challenge = String(data.challenge);
+  const salt = String(data.salt);
+  const max = Number(data.maxnumber) > 0 ? Number(data.maxnumber) : 100000;
+  const algoRaw = String(data.algorithm || 'SHA-256').toUpperCase();
+  const algo = algoRaw === 'SHA-1' ? 'sha1' : algoRaw === 'SHA-512' ? 'sha512' : 'sha256';
+  const start = Date.now();
+  let number = null;
+  for (let n = 0; n <= max; n++) {
+    if (crypto.createHash(algo).update(salt + String(n)).digest('hex') === challenge) {
+      number = n;
+      break;
+    }
+  }
+  if (number === null) throw new Error('Could not solve challenge');
+  const payload = {
+    algorithm: data.algorithm || 'SHA-256',
+    challenge,
+    number,
+    salt,
+    signature: data.signature || '',
+    took: Math.max(1, Date.now() - start),
+  };
+  return {
+    success: true,
+    token: Buffer.from(JSON.stringify(payload)).toString('base64'),
+    number: payload.number,
+    took: payload.took,
+    payload,
+    challenge: data,
+  };
+}
 
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
@@ -134,6 +143,274 @@ app.post('/storechat', async (req, res) => {
     console.error('[storechat] error', error.message);
     return res.status(500).json({ success: false, message: error.message });
   }
+});
+
+const WP_DELHIVERY_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/delhivery_tracking';
+
+/** Same as appcron copy: status + tracking_states + edd */
+async function delhiveryFetchAwb(awb) {
+  const url = 'https://dlv-api.delhivery.com/v3/unified-tracking?wbn=' + encodeURIComponent(awb);
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { origin: 'https://www.delhivery.com', Accept: 'application/json' },
+  });
+  const data = await res.json().catch(() => null);
+  if (!data || !data.data || !data.data[0] || !data.data[0].status) {
+    return { awb, status: '', tracking_states: [], edd: '', error: 'Invalid API response' };
+  }
+  const row = data.data[0];
+  return {
+    awb,
+    status: String((row.status && row.status.status) || ''),
+    tracking_states: Array.isArray(row.trackingStates) ? row.trackingStates : [],
+    edd: String(row.promiseDeliveryDate || ''),
+  };
+}
+
+/**
+ * Cron → turant received → Delhivery status+tracking_states+edd → WP webhook
+ * POST /dehlivery_tracking  body: { orders: [ { order_id, awb: [] } ] }
+ */
+app.post('/dehlivery_tracking', (req, res) => {
+  const body = req.body || {};
+  const ordersIn = Array.isArray(body.orders) ? body.orders : [];
+  const type = String(body.type || 'b2c');
+  res.status(200).json({ success: true, message: 'received', count: ordersIn.length, type });
+
+  setImmediate(async () => {
+    try {
+      const out = [];
+      for (const row of ordersIn) {
+        if (!row || typeof row !== 'object') continue;
+        const orderId = Number(row.order_id || 0);
+        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+        if (!orderId || !awbs.length) continue;
+
+        const awbResults = [];
+        for (const awb of awbs) {
+          try {
+            awbResults.push(await delhiveryFetchAwb(awb));
+          } catch (e) {
+            awbResults.push({
+              awb,
+              status: '',
+              tracking_states: [],
+              edd: '',
+              error: e.message || 'fetch failed',
+            });
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        out.push({ order_id: orderId, awbs: awbResults });
+      }
+      if (!out.length) return;
+
+      const wpRes = await fetch(WP_DELHIVERY_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out, type }),
+      });
+      console.log('[dehlivery_tracking]', type, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+    } catch (err) {
+      console.error('[dehlivery_tracking] error', err.message);
+    }
+  });
+});
+
+const WP_AMAZON_HOOK = process.env.WP_AMAZON_HOOK || 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
+const WP_XPRESSBEE_HOOK = process.env.WP_XPRESSBEE_HOOK || 'https://restinfoot.com/wp-json/appcron/v1/xpressbee_tracking';
+
+/** Same as appcron copy amazon_api_get_tracker_status → status + edd */
+async function amazonFetchAwb(awb) {
+  const url = 'https://track.amazon.in/api/tracker/' + encodeURIComponent(awb);
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      Accept: 'application/json',
+      Origin: 'https://track.amazon.in',
+    },
+  });
+  const data = await res.json().catch(() => null);
+  if (!data || data.eventHistory == null) {
+    return { awb, status: '', edd: '', error: 'Invalid response' };
+  }
+
+  let eventHistory = null;
+  try {
+    eventHistory = typeof data.eventHistory === 'string'
+      ? JSON.parse(data.eventHistory)
+      : data.eventHistory;
+  } catch (_) {
+    return { awb, status: '', edd: '', error: 'Could not parse eventHistory' };
+  }
+  if (!eventHistory || typeof eventHistory !== 'object') {
+    return { awb, status: '', edd: '', error: 'Could not parse eventHistory' };
+  }
+
+  const summaryStatus = String((eventHistory.summary && eventHistory.summary.status) || '').trim();
+  const events = Array.isArray(eventHistory.eventHistory) ? eventHistory.eventHistory : [];
+
+  let promised = '';
+  let progress = null;
+  try {
+    if (data.progressTracker != null) {
+      progress = typeof data.progressTracker === 'string'
+        ? JSON.parse(data.progressTracker)
+        : data.progressTracker;
+    }
+  } catch (_) {
+    progress = null;
+  }
+  if (!progress && eventHistory.progressTracker) progress = eventHistory.progressTracker;
+
+  const metaBlocks = [];
+  if (progress && progress.summary && Array.isArray(progress.summary.metadata)) {
+    metaBlocks.push(progress.summary.metadata);
+  }
+  if (eventHistory.summary && Array.isArray(eventHistory.summary.metadata)) {
+    metaBlocks.push(eventHistory.summary.metadata);
+  }
+  for (const meta of metaBlocks) {
+    const expected = String((meta.expectedDeliveryDate && meta.expectedDeliveryDate.date) || '').trim();
+    if (expected) {
+      promised = expected;
+      break;
+    }
+    const fallback = String((meta.promisedDeliveryDate && meta.promisedDeliveryDate.date) || '').trim();
+    if (fallback && !promised) promised = fallback;
+  }
+
+  let resolved = summaryStatus;
+  if (events.length) {
+    const last = events[events.length - 1];
+    const localisedId = String((last && last.statusSummary && last.statusSummary.localisedStringId) || '');
+    const summaryInTransitOrOfd = ['IN_TRANSIT', 'OUT_FOR_DELIVERY', 'OFD'].includes(summaryStatus);
+    if (localisedId === 'swa_rex_arrived_at_final_hub' && summaryInTransitOrOfd) {
+      resolved = 'REACH_DEST_FINAL_HUB';
+    }
+  }
+
+  return { awb, status: resolved, edd: promised };
+}
+
+app.post('/amazon-tracking', (req, res) => {
+  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+  res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
+
+  setImmediate(async () => {
+    try {
+      const out = [];
+      for (const row of ordersIn) {
+        if (!row || typeof row !== 'object') continue;
+        const orderId = Number(row.order_id || 0);
+        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+        if (!orderId || !awbs.length) continue;
+
+        const awbResults = [];
+        for (const awb of awbs) {
+          try {
+            awbResults.push(await amazonFetchAwb(awb));
+          } catch (e) {
+            awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        out.push({ order_id: orderId, awbs: awbResults });
+      }
+      if (!out.length) return;
+
+      const wpRes = await fetch(WP_AMAZON_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out }),
+      });
+      console.log('[amazon-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+    } catch (err) {
+      console.error('[amazon-tracking] error', err.message);
+    }
+  });
+});
+
+/** Same as appcron copy xpressbee_api → status + edd */
+async function xpressbeeFetchAwb(awb, token) {
+  const res = await fetch('https://www.xpressbees.com/api/tracking', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ awbNo: awb, altchaPayload: token }),
+  });
+  const raw = await res.text();
+  if (res.status < 200 || res.status >= 300) {
+    return { awb, status: '', edd: '', error: 'HTTP ' + res.status + ': ' + raw.slice(0, 200) };
+  }
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return { awb, status: '', edd: '', error: 'Invalid JSON' };
+  }
+
+  let status = '';
+  let edd = '';
+  if (data && data.domestic && data.domestic[0]) {
+    status = String(data.domestic[0].status || '');
+    edd = String(data.domestic[0].EDD || data.domestic[0].edd || '');
+  } else if (data && data.international && data.international[0]) {
+    status = String(data.international[0].status || '');
+    edd = String(data.international[0].EDD || data.international[0].edd || '');
+  }
+  return { awb, status, edd };
+}
+
+app.post('/xpressbee-tracking', (req, res) => {
+  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+  res.status(200).json({ success: true, message: 'received', count: ordersIn.length });
+
+  setImmediate(async () => {
+    try {
+      let token = '';
+      try {
+        const ch = await solveAltchaToken();
+        token = String(ch.token || '');
+      } catch (e) {
+        console.error('[xpressbee-tracking] token error', e.message);
+        return;
+      }
+      if (!token) return;
+
+      const out = [];
+      for (const row of ordersIn) {
+        if (!row || typeof row !== 'object') continue;
+        const orderId = Number(row.order_id || 0);
+        let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+        awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+        if (!orderId || !awbs.length) continue;
+
+        const awbResults = [];
+        for (const awb of awbs) {
+          try {
+            awbResults.push(await xpressbeeFetchAwb(awb, token));
+          } catch (e) {
+            awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        out.push({ order_id: orderId, awbs: awbResults });
+      }
+      if (!out.length) return;
+
+      const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ orders: out }),
+      });
+      console.log('[xpressbee-tracking] wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+    } catch (err) {
+      console.error('[xpressbee-tracking] error', err.message);
+    }
+  });
 });
 
 // memory mein last historyId (Firebase nahi)
