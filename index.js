@@ -218,8 +218,8 @@ app.post('/dehlivery_tracking', (req, res) => {
   });
 });
 
-const WP_AMAZON_HOOK = process.env.WP_AMAZON_HOOK || 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
-const WP_XPRESSBEE_HOOK = process.env.WP_XPRESSBEE_HOOK || 'https://restinfoot.com/wp-json/appcron/v1/xpressbee_tracking';
+const WP_AMAZON_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
+const WP_XPRESSBEE_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/xpressbee_tracking';
 
 /** Same as appcron copy amazon_api_get_tracker_status → status + edd */
 async function amazonFetchAwb(awb) {
