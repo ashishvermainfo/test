@@ -168,67 +168,79 @@ async function delhiveryFetchAwb(awb) {
 }
 
 /**
- * Cron → Delhivery API → WP webhook → phir response
- * Vercel: res.json() KE BAAD code kill ho sakta hai — pehle kaam, phir response.
+ * Cron → turant response, tracking + WP webhook background mein
  */
-app.post('/dehlivery_tracking', async (req, res) => {
+async function delhiveryTrackingJob(ordersIn, type) {
+  console.log('[dehlivery_tracking] bg start', type, 'orders=', ordersIn.length);
+  const out = [];
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    const orderId = Number(row.order_id || 0);
+    let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+    awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+    if (!orderId || !awbs.length) continue;
+
+    const awbResults = [];
+    for (const awb of awbs) {
+      try {
+        awbResults.push(await delhiveryFetchAwb(awb));
+      } catch (e) {
+        awbResults.push({
+          awb,
+          status: '',
+          tracking_states: [],
+          edd: '',
+          error: e.message || 'fetch failed',
+        });
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    out.push({ order_id: orderId, awbs: awbResults });
+  }
+
+  if (!out.length) {
+    console.log('[dehlivery_tracking] bg nothing to post', type);
+    return;
+  }
+
+  const wpRes = await fetch(WP_DELHIVERY_HOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ orders: out, type }),
+  });
+  const wpBody = (await wpRes.text()).slice(0, 300);
+  console.log('[dehlivery_tracking] bg done', type, 'tracked=', out.length, 'wp', wpRes.status, wpBody);
+}
+
+function runInBackground(promise) {
+  const p = Promise.resolve(promise).catch((err) => {
+    console.error('[bg] error', err && err.message ? err.message : err);
+  });
+  try {
+    // Vercel: response ke baad process alive rakho
+    const { waitUntil } = require('@vercel/functions');
+    if (typeof waitUntil === 'function') {
+      waitUntil(p);
+      return;
+    }
+  } catch (_) {}
+  // Local / long-running node
+}
+
+app.post('/dehlivery_tracking', (req, res) => {
   const body = req.body || {};
   const ordersIn = Array.isArray(body.orders) ? body.orders : [];
   const type = String(body.type || 'b2c');
 
-  try {
-    console.log('[dehlivery_tracking] start', type, 'orders=', ordersIn.length);
-    const out = [];
-    for (const row of ordersIn) {
-      if (!row || typeof row !== 'object') continue;
-      const orderId = Number(row.order_id || 0);
-      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-      if (!orderId || !awbs.length) continue;
+  // Turant response — tracking baad mein
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+    type,
+  });
 
-      const awbResults = [];
-      for (const awb of awbs) {
-        try {
-          awbResults.push(await delhiveryFetchAwb(awb));
-        } catch (e) {
-          awbResults.push({
-            awb,
-            status: '',
-            tracking_states: [],
-            edd: '',
-            error: e.message || 'fetch failed',
-          });
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      out.push({ order_id: orderId, awbs: awbResults });
-    }
-
-    let wpStatus = 0;
-    let wpBody = '';
-    if (out.length) {
-      const wpRes = await fetch(WP_DELHIVERY_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out, type }),
-      });
-      wpStatus = wpRes.status;
-      wpBody = (await wpRes.text()).slice(0, 300);
-      console.log('[dehlivery_tracking]', type, 'wp', wpStatus, wpBody);
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'done',
-      count: ordersIn.length,
-      tracked: out.length,
-      type,
-      wp_status: wpStatus,
-    });
-  } catch (err) {
-    console.error('[dehlivery_tracking] error', err.message);
-    return res.status(200).json({ success: false, message: err.message, type });
-  }
+  runInBackground(delhiveryTrackingJob(ordersIn, type));
 });
 
 const WP_AMAZON_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
@@ -319,53 +331,49 @@ async function amazonFetchAwb(awb) {
   return { awb, status: resolved, edd: promised };
 }
 
-app.post('/amazon-tracking', async (req, res) => {
-  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+async function amazonTrackingJob(ordersIn) {
+  console.log('[amazon-tracking] bg start orders=', ordersIn.length);
+  const out = [];
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    const orderId = Number(row.order_id || 0);
+    let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+    awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+    if (!orderId || !awbs.length) continue;
 
-  try {
-    console.log('[amazon-tracking] start orders=', ordersIn.length);
-    const out = [];
-    for (const row of ordersIn) {
-      if (!row || typeof row !== 'object') continue;
-      const orderId = Number(row.order_id || 0);
-      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-      if (!orderId || !awbs.length) continue;
-
-      const awbResults = [];
-      for (const awb of awbs) {
-        try {
-          awbResults.push(await amazonFetchAwb(awb));
-        } catch (e) {
-          awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
-        }
-        await new Promise((r) => setTimeout(r, 200));
+    const awbResults = [];
+    for (const awb of awbs) {
+      try {
+        awbResults.push(await amazonFetchAwb(awb));
+      } catch (e) {
+        awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
       }
-      out.push({ order_id: orderId, awbs: awbResults });
+      await new Promise((r) => setTimeout(r, 200));
     }
-
-    let wpStatus = 0;
-    if (out.length) {
-      const wpRes = await fetch(WP_AMAZON_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out }),
-      });
-      wpStatus = wpRes.status;
-      console.log('[amazon-tracking] wp', wpStatus, (await wpRes.text()).slice(0, 300));
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'done',
-      count: ordersIn.length,
-      tracked: out.length,
-      wp_status: wpStatus,
-    });
-  } catch (err) {
-    console.error('[amazon-tracking] error', err.message);
-    return res.status(200).json({ success: false, message: err.message });
+    out.push({ order_id: orderId, awbs: awbResults });
   }
+
+  if (!out.length) {
+    console.log('[amazon-tracking] bg nothing to post');
+    return;
+  }
+
+  const wpRes = await fetch(WP_AMAZON_HOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ orders: out }),
+  });
+  console.log('[amazon-tracking] bg done tracked=', out.length, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+}
+
+app.post('/amazon-tracking', (req, res) => {
+  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+  });
+  runInBackground(amazonTrackingJob(ordersIn));
 });
 
 /** Same as appcron copy xpressbee_api → status + edd */
@@ -398,59 +406,241 @@ async function xpressbeeFetchAwb(awb, token) {
   return { awb, status, edd };
 }
 
-app.post('/xpressbee-tracking', async (req, res) => {
-  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
-
-  try {
-    console.log('[xpressbee-tracking] start orders=', ordersIn.length);
-    const ch = await solveAltchaToken();
-    const token = String(ch.token || '');
-    if (!token) {
-      return res.status(200).json({ success: false, message: 'no altcha token' });
-    }
-
-    const out = [];
-    for (const row of ordersIn) {
-      if (!row || typeof row !== 'object') continue;
-      const orderId = Number(row.order_id || 0);
-      let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
-      awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
-      if (!orderId || !awbs.length) continue;
-
-      const awbResults = [];
-      for (const awb of awbs) {
-        try {
-          awbResults.push(await xpressbeeFetchAwb(awb, token));
-        } catch (e) {
-          awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      out.push({ order_id: orderId, awbs: awbResults });
-    }
-
-    let wpStatus = 0;
-    if (out.length) {
-      const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ orders: out }),
-      });
-      wpStatus = wpRes.status;
-      console.log('[xpressbee-tracking] wp', wpStatus, (await wpRes.text()).slice(0, 300));
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'done',
-      count: ordersIn.length,
-      tracked: out.length,
-      wp_status: wpStatus,
-    });
-  } catch (err) {
-    console.error('[xpressbee-tracking] error', err.message);
-    return res.status(200).json({ success: false, message: err.message });
+async function xpressbeeTrackingJob(ordersIn) {
+  console.log('[xpressbee-tracking] bg start orders=', ordersIn.length);
+  const ch = await solveAltchaToken();
+  const token = String(ch.token || '');
+  if (!token) {
+    console.error('[xpressbee-tracking] bg no altcha token');
+    return;
   }
+
+  const out = [];
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    const orderId = Number(row.order_id || 0);
+    let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+    awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+    if (!orderId || !awbs.length) continue;
+
+    const awbResults = [];
+    for (const awb of awbs) {
+      try {
+        awbResults.push(await xpressbeeFetchAwb(awb, token));
+      } catch (e) {
+        awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    out.push({ order_id: orderId, awbs: awbResults });
+  }
+
+  if (!out.length) {
+    console.log('[xpressbee-tracking] bg nothing to post');
+    return;
+  }
+
+  const wpRes = await fetch(WP_XPRESSBEE_HOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ orders: out }),
+  });
+  console.log('[xpressbee-tracking] bg done tracked=', out.length, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+}
+
+app.post('/xpressbee-tracking', (req, res) => {
+  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+  });
+  runInBackground(xpressbeeTrackingJob(ordersIn));
+});
+
+const WP_SEND_MAIL_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/send_mail';
+const MAIL_FROM_NAME = 'vivek agarwal';
+
+function getGmailClient() {
+  const oauth2 = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET
+  );
+  oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+  return google.gmail({ version: 'v1', auth: oauth2 });
+}
+
+function parseMailList(raw) {
+  const out = [];
+  for (const part of String(raw || '').split(/[,;]+/)) {
+    const e = part.trim().toLowerCase();
+    if (e && e.includes('@')) out.push(e);
+  }
+  return [...new Set(out)];
+}
+
+function encodeMailHeader(v) {
+  const s = String(v || '');
+  return /[^\x20-\x7E]/.test(s) ? '=?UTF-8?B?' + Buffer.from(s, 'utf8').toString('base64') + '?=' : s;
+}
+
+function toBase64Url(data) {
+  return Buffer.from(data)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function gmailHdr(headers, name) {
+  const n = String(name || '').toLowerCase();
+  for (const h of headers || []) {
+    if (String(h.name || '').toLowerCase() === n) return String(h.value || '');
+  }
+  return '';
+}
+
+/**
+ * One mail via Gmail API (new | reply). Same idea as PHP send_mail_dispatch.
+ */
+async function sendOneGmail(gmail, row) {
+  const orderId = Number(row.order_id || 0);
+  const toList = parseMailList(row.to);
+  const ccList = parseMailList(row.cc);
+  const bccList = parseMailList(row.bcc);
+  const subject = String(row.subject || '').trim();
+  const body = String(row.body || '');
+  let mailType = String(row.mail_type || 'new').toLowerCase();
+  if (!['new', 'reply', 'forward'].includes(mailType)) mailType = 'new';
+  let threadId = String(row.thread_id || '').trim();
+  const courier = String(row.courier || '').trim();
+  const meta = row.meta && typeof row.meta === 'object' ? row.meta : {};
+  const irt = String(row.in_reply_to || '').trim();
+  const refs = String(row.references || '').trim();
+
+  const base = {
+    order_id: orderId,
+    courier,
+    meta,
+    mail_type: mailType,
+    subject,
+    body,
+    mail_to: toList.join(', '),
+    mail_cc: ccList.join(', '),
+    mail_bcc: bccList.join(', '),
+    mail_from: MY_EMAIL,
+  };
+
+  if (!orderId || !toList.length || !subject || !body.replace(/<[^>]*>/g, '').trim()) {
+    return { ...base, ok: false, thread_id: threadId, msg_id: '', rfc_message_id: '', error: 'order_id/to/subject/body required' };
+  }
+
+  const hdr = [
+    'From: ' + encodeMailHeader(MAIL_FROM_NAME) + ' <' + MY_EMAIL + '>',
+    'To: ' + toList.join(', '),
+    'Subject: ' + encodeMailHeader(subject),
+    'MIME-Version: 1.0',
+  ];
+  if (ccList.length) hdr.push('Cc: ' + ccList.join(', '));
+  if (bccList.length) hdr.push('Bcc: ' + bccList.join(', '));
+  if (irt) {
+    hdr.push('In-Reply-To: ' + irt);
+    hdr.push('References: ' + (refs || irt));
+  }
+  hdr.push('Content-Type: text/html; charset=UTF-8');
+  hdr.push('Content-Transfer-Encoding: base64');
+
+  const b64body = Buffer.from(body, 'utf8').toString('base64');
+  const raw = hdr.join('\r\n') + '\r\n\r\n' + (b64body.match(/.{1,76}/g) || [b64body]).join('\r\n');
+
+  const payload = { raw: toBase64Url(raw) };
+  if (mailType === 'reply' && threadId) payload.threadId = threadId;
+
+  const sent = await gmail.users.messages.send({ userId: 'me', requestBody: payload });
+  const msgId = String((sent.data && sent.data.id) || '');
+  threadId = String((sent.data && sent.data.threadId) || threadId);
+  if (!msgId) {
+    return { ...base, ok: false, thread_id: threadId, msg_id: '', rfc_message_id: '', error: 'No message id from Gmail' };
+  }
+
+  let rfc = '';
+  try {
+    const full = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
+    const headers = (full.data && full.data.payload && full.data.payload.headers) || [];
+    rfc = gmailHdr(headers, 'Message-ID');
+  } catch (_) {}
+
+  return {
+    ...base,
+    ok: true,
+    thread_id: threadId,
+    msg_id: msgId,
+    rfc_message_id: rfc,
+    error: '',
+  };
+}
+
+/**
+ * Cron → turant accept; Gmail send + WP webhook background
+ * body.orders[]: order_id, to, cc, bcc, subject, body, mail_type, thread_id, courier, meta
+ */
+async function sendMailJob(ordersIn, type) {
+  console.log('[send_mail] bg start', type, 'orders=', ordersIn.length);
+  const gmail = getGmailClient();
+  const out = [];
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    try {
+      out.push(await sendOneGmail(gmail, row));
+    } catch (e) {
+      out.push({
+        order_id: Number(row.order_id || 0),
+        ok: false,
+        thread_id: String(row.thread_id || ''),
+        msg_id: '',
+        rfc_message_id: '',
+        courier: String(row.courier || ''),
+        meta: row.meta && typeof row.meta === 'object' ? row.meta : {},
+        mail_type: String(row.mail_type || 'new'),
+        subject: String(row.subject || ''),
+        body: String(row.body || ''),
+        mail_to: String(row.to || ''),
+        mail_cc: String(row.cc || ''),
+        mail_bcc: String(row.bcc || ''),
+        mail_from: MY_EMAIL,
+        error: e.message || 'send failed',
+      });
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  if (!out.length) {
+    console.log('[send_mail] bg nothing to post', type);
+    return;
+  }
+
+  const wpRes = await fetch(WP_SEND_MAIL_HOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ orders: out, type }),
+  });
+  const wpBody = (await wpRes.text()).slice(0, 300);
+  console.log('[send_mail] bg done', type, 'sent=', out.length, 'wp', wpRes.status, wpBody);
+}
+
+app.post('/send_mail', (req, res) => {
+  const body = req.body || {};
+  const ordersIn = Array.isArray(body.orders) ? body.orders : [];
+  const type = String(body.type || '');
+
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+    type,
+  });
+
+  runInBackground(sendMailJob(ordersIn, type));
 });
 
 // memory mein last historyId (Firebase nahi)
@@ -476,12 +666,7 @@ app.post('/gmailwebhook', async (req, res) => {
     }
 
     // 2) Gmail client (OAuth)
-    const oauth2 = new google.auth.OAuth2(
-      process.env.GMAIL_CLIENT_ID,
-      process.env.GMAIL_CLIENT_SECRET
-    );
-    oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-    const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+    const gmail = getGmailClient();
 
     // 3) first time seed
     if (!lastHistoryId) {
