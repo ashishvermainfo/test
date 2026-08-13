@@ -921,7 +921,7 @@ app.post('/gmailwebhook', (req, res) => {
 });
 
 // Call Log Queue with Smart 2-Min Idle Debounce & 5-Min Max Cap Flush
-const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/webhook';
+const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/node-webhook';
 let callLogQueue = [];
 let callLogDebounceTimer = null; // 2 min idle timer
 let callLogMaxTimer = null;      // 5 min max cap timer
