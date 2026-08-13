@@ -961,8 +961,14 @@ app.post(['/calllogwebhook'], (req, res) => {
           await batch.commit();
           console.log(`[calllogwebhook] Saved ${newLogs.length} logs to Firestore queue (docId: user_number_timestamp)`);
 
-          // 2-Minute Batch Timer Handle: 2 min tak saare incoming logs accumulate hoke 1 POST me jayenge
-          if (!callLogFlushTimer) {
+          // 2-Minute Batch Timer Handle: Container un-freeze hone par agar 2 min beet chuke hain to instantly flush karega
+          const oldest = await firestore.collection(CALL_LOGS_COLLECTION).orderBy('created_at', 'asc').limit(1).get();
+          const oldestTime = !oldest.empty ? Number(oldest.docs[0].data().created_at || 0) : Date.now();
+
+          if (oldestTime && Date.now() - oldestTime >= 120000) {
+            console.log('[calllogwebhook] Next API call triggered & 2 mins passed since first log: Flushing batch immediately!');
+            await flushCallLogsToWP();
+          } else if (!callLogFlushTimer) {
             callLogFlushTimer = setTimeout(() => {
               runInBackground(flushCallLogsToWP());
             }, 120000); // 2 Minutes
