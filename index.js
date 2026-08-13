@@ -223,7 +223,7 @@ function runInBackground(promise) {
       waitUntil(p);
       return;
     }
-  } catch (_) {}
+  } catch (_) { }
   // Local / long-running node
 }
 
@@ -568,7 +568,7 @@ async function sendOneGmail(gmail, row) {
     const full = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
     const headers = (full.data && full.data.payload && full.data.payload.headers) || [];
     rfc = gmailHdr(headers, 'Message-ID');
-  } catch (_) {}
+  } catch (_) { }
 
   return {
     ...base,
@@ -645,42 +645,89 @@ app.post('/send_mail', (req, res) => {
 
 // memory mein last historyId (Firebase nahi)
 let lastHistoryId = '';
+let isProcessingGmail = false;
+let pendingMailQueue = [];
+let mailFlushTimer = null;
+let isFlushingMail = false;
 
-// Pub/Sub → Gmail → restinfoot POST → phir response
-app.post('/gmailwebhook', async (req, res) => {
+function queueMailMessagesForWordPress(newMessages, emailAddress, newestHistoryId) {
+  if (!Array.isArray(newMessages) || !newMessages.length) return;
+
+  const existingIds = new Set(pendingMailQueue.map((m) => m.msg_id));
+  for (const msg of newMessages) {
+    if (msg && msg.msg_id && !existingIds.has(msg.msg_id)) {
+      pendingMailQueue.push(msg);
+      existingIds.add(msg.msg_id);
+    }
+  }
+
+  // Schedule 1-minute batch flush to restinfoot WordPress webhook
+  if (!mailFlushTimer && pendingMailQueue.length > 0) {
+    mailFlushTimer = setTimeout(() => {
+      mailFlushTimer = null;
+      runInBackground(flushMailQueueToWordPress(emailAddress, newestHistoryId));
+    }, 60000);
+  }
+}
+
+async function flushMailQueueToWordPress(emailAddress, newestHistoryId) {
+  if (isFlushingMail || !pendingMailQueue.length) return;
+  isFlushingMail = true;
+
+  const messagesToSend = [...pendingMailQueue];
+  pendingMailQueue = [];
+
   try {
-    // 1) historyId from Pub/Sub
-    let historyId = '';
-    let emailAddress = MY_EMAIL;
-    if (req.body && req.body.message && req.body.message.data) {
-      let raw = String(req.body.message.data).replace(/-/g, '+').replace(/_/g, '/');
-      while (raw.length % 4) raw += '=';
-      const decoded = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
-      historyId = String(decoded.historyId || '');
-      emailAddress = decoded.emailAddress || MY_EMAIL;
-    } else if (req.body && req.body.historyId) {
-      historyId = String(req.body.historyId);
+    console.log(`[gmailwebhook] Flushing batch of ${messagesToSend.length} mail messages to WordPress...`);
+    const wpRes = await fetch(WP_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        source: 'node-gmail',
+        emailAddress: emailAddress || MY_EMAIL,
+        historyId: newestHistoryId || lastHistoryId,
+        messages: messagesToSend,
+      }),
+    });
+    const wpText = await wpRes.text();
+    console.log(`[gmailwebhook] WordPress response status: ${wpRes.status}, body: ${wpText.substring(0, 200)}`);
+  } catch (wpErr) {
+    console.error('[gmailwebhook] wp hook error:', wpErr.message);
+    // Re-queue un-sent messages if request failed
+    pendingMailQueue.unshift(...messagesToSend);
+  } finally {
+    isFlushingMail = false;
+    if (pendingMailQueue.length > 0 && !mailFlushTimer) {
+      mailFlushTimer = setTimeout(() => {
+        mailFlushTimer = null;
+        runInBackground(flushMailQueueToWordPress(emailAddress, newestHistoryId));
+      }, 60000);
     }
-    if (!historyId) {
-      return res.status(200).json({ success: false, message: 'no historyId' });
-    }
+  }
+}
 
-    // 2) Gmail client (OAuth)
+async function processGmailWebhook(historyId, emailAddress) {
+  if (isProcessingGmail) {
+    console.log('[gmailwebhook] Already processing a history batch, skipping concurrent run');
+    return;
+  }
+  isProcessingGmail = true;
+
+  try {
     const gmail = getGmailClient();
 
-    // 3) first time seed
     if (!lastHistoryId) {
       const profile = await gmail.users.getProfile({ userId: 'me' });
       lastHistoryId = String((profile.data && profile.data.historyId) || historyId);
-      return res.status(200).json({ success: true, message: 'seeded', historyId: lastHistoryId });
+      console.log('[gmailwebhook] Seeded lastHistoryId:', lastHistoryId);
+      return;
     }
 
     const startId = lastHistoryId;
-
-    // 4) history → message ids
     const msgIds = new Set();
     let pageToken = '';
     let newestHistoryId = startId;
+
     try {
       do {
         const histRes = await gmail.users.history.list({
@@ -701,24 +748,37 @@ app.post('/gmailwebhook', async (req, res) => {
         pageToken = hist.nextPageToken || '';
       } while (pageToken);
     } catch (e) {
-      if (e.code === 404) {
+      const isNotFound =
+        e.code === 404 ||
+        e.code === '404' ||
+        e.status === 404 ||
+        (e.response && e.response.status === 404) ||
+        (e.message && e.message.includes('Requested entity was not found'));
+      if (isNotFound) {
         const profile = await gmail.users.getProfile({ userId: 'me' });
         lastHistoryId = String((profile.data && profile.data.historyId) || historyId);
-        return res.status(200).json({ success: true, message: 'history reset', historyId: lastHistoryId });
+        console.log('[gmailwebhook] History ID expired/not found, reset historyId to latest:', lastHistoryId);
+        return;
       }
       throw e;
     }
 
     lastHistoryId = newestHistoryId;
     if (!msgIds.size) {
-      return res.status(200).json({ success: true, message: 'no new messages', historyId: newestHistoryId });
+      console.log('[gmailwebhook] No new messages found in history range');
+      return;
     }
 
-    // 5) full messages → inbound only
     const messages = [];
     for (const id of msgIds) {
-      const full = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
-      const msg = full.data;
+      let full;
+      try {
+        full = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
+      } catch (getErr) {
+        console.warn(`[gmailwebhook] Skipping message ${id} (not found or deleted):`, getErr.message);
+        continue;
+      }
+      const msg = full ? full.data : null;
       if (!msg || !msg.id) continue;
 
       const headers = (msg.payload && msg.payload.headers) || [];
@@ -818,47 +878,111 @@ app.post('/gmailwebhook', async (req, res) => {
       });
     }
 
-    if (!messages.length) {
-      return res.status(200).json({ success: true, message: 'no inbound', historyId: newestHistoryId });
+    if (messages.length) {
+      queueMailMessagesForWordPress(messages, emailAddress, newestHistoryId);
     }
-
-    // 6) restinfoot webhook — fail ho to bhi Pub/Sub ko 200
-    let wpStatus = 0;
-    let wpData = null;
-    try {
-      const wpRes = await fetch(WP_HOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({
-          source: 'node-gmail',
-          emailAddress,
-          historyId: newestHistoryId,
-          messages,
-        }),
-      });
-      wpStatus = wpRes.status;
-      const wpText = await wpRes.text();
-      try {
-        wpData = wpText ? JSON.parse(wpText) : null;
-      } catch (_) {
-        wpData = { raw: wpText };
-      }
-    } catch (wpErr) {
-      console.error('[gmailwebhook] wp hook error', wpErr.message);
-      wpData = { success: false, message: wpErr.message };
-    }
-
-    return res.status(200).json({
-      success: true,
-      count: messages.length,
-      historyId: newestHistoryId,
-      wp_status: wpStatus,
-      wp: wpData,
-    });
   } catch (err) {
     console.error('[gmailwebhook] error', err.message);
-    return res.status(200).json({ success: false, message: err.message });
+  } finally {
+    isProcessingGmail = false;
   }
+}
+
+// Pub/Sub → Gmail → Queue in Node → restinfoot POST every 1 min → Pub/Sub gets 200 OK immediately
+app.post('/gmailwebhook', (req, res) => {
+  try {
+    let historyId = '';
+    let emailAddress = MY_EMAIL;
+    if (req.body && req.body.message && req.body.message.data) {
+      let raw = String(req.body.message.data).replace(/-/g, '+').replace(/_/g, '/');
+      while (raw.length % 4) raw += '=';
+      const decoded = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+      historyId = String(decoded.historyId || '');
+      emailAddress = decoded.emailAddress || MY_EMAIL;
+    } else if (req.body && req.body.historyId) {
+      historyId = String(req.body.historyId);
+    }
+
+    if (!historyId) {
+      return res.status(200).json({ success: false, message: 'no historyId' });
+    }
+
+    // 1) Google Pub/Sub ko turant 200 OK return karo
+    res.status(200).json({ success: true, message: 'accepted', historyId });
+
+    // 2) Background worker me Gmail history check & 1-minute batch queue me insert karo
+    runInBackground(processGmailWebhook(historyId, emailAddress));
+  } catch (err) {
+    console.error('[gmailwebhook] express error', err.message);
+    if (!res.headersSent) {
+      res.status(200).json({ success: false, message: err.message });
+    }
+  }
+});
+
+// Call Log Queue with Smart 2-Min Idle Debounce & 5-Min Max Cap Flush
+const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/webhook';
+let callLogQueue = [];
+let callLogDebounceTimer = null; // 2 min idle timer
+let callLogMaxTimer = null;      // 5 min max cap timer
+
+async function sendCallLogsToWP() {
+  if (callLogDebounceTimer) { clearTimeout(callLogDebounceTimer); callLogDebounceTimer = null; }
+  if (callLogMaxTimer) { clearTimeout(callLogMaxTimer); callLogMaxTimer = null; }
+
+  if (!callLogQueue.length) return;
+  const logs = [...callLogQueue];
+  callLogQueue = [];
+  try {
+    await fetch(WP_CALL_LOG_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ source: 'node-call-log', logs }),
+    });
+    console.log('[calllogwebhook] Sent batch of', logs.length, 'logs to WP');
+  } catch (err) {
+    console.error('[calllogwebhook] error', err.message);
+    callLogQueue.unshift(...logs);
+  }
+}
+
+app.post(['/calllogwebhook'], (req, res) => {
+  res.status(200).json({ success: true, message: 'accepted' });
+
+  runInBackground(
+    Promise.resolve().then(() => {
+      const data = req.body || {};
+      const spUser = String(data.user || data.salesperson_number || '').replace(/\D+/g, '');
+      const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
+
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const user = String(item.user || spUser).replace(/\D+/g, '');
+        const number = String(item.number || item.customer_number || '').replace(/\D+/g, '');
+        const timestamp = Number(item.timestamp || item.call_timestamp || 0);
+        if (user && number && timestamp) {
+          callLogQueue.push({
+            user,
+            number,
+            status: String(item.status || item.type || 'unknown'),
+            duration: Number(item.duration || 0),
+            timestamp,
+          });
+        }
+      }
+
+      if (callLogQueue.length > 0) {
+        // 1) 2 min idle (debounce) timer — jab bhi naye hit aayenge ye reset hoga
+        if (callLogDebounceTimer) clearTimeout(callLogDebounceTimer);
+        callLogDebounceTimer = setTimeout(() => runInBackground(sendCallLogsToWP()), 120000);
+
+        // 2) 5 min max cap timer — agar continuous hits aate rahein to max 5 min me bhej dega
+        if (!callLogMaxTimer) {
+          callLogMaxTimer = setTimeout(() => runInBackground(sendCallLogsToWP()), 300000);
+        }
+      }
+    })
+  );
 });
 
 const PORT = process.env.PORT || 3000;
