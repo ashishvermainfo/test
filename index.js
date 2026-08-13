@@ -934,16 +934,26 @@ async function sendCallLogsToWP() {
   const logs = [...callLogQueue];
   callLogQueue = [];
   try {
-    await fetch(WP_CALL_LOG_HOOK, {
+    const res = await fetch(WP_CALL_LOG_HOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ source: 'node-call-log', logs }),
     });
-    console.log('[calllogwebhook] Sent batch of', logs.length, 'logs to WP');
+    const text = await res.text();
+    console.log('[calllogwebhook] Sent batch of', logs.length, 'logs to WP, status:', res.status, text.substring(0, 100));
+    if (!res.ok) {
+      callLogQueue.unshift(...logs);
+    }
   } catch (err) {
-    console.error('[calllogwebhook] error', err.message);
+    console.error('[calllogwebhook] error', err.message, err.cause ? (err.cause.message || err.cause) : '');
     callLogQueue.unshift(...logs);
   }
+}
+
+function normalizePhone(val) {
+  const digits = String(val || '').replace(/\D+/g, '');
+  if (!digits) return '';
+  return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
 app.post(['/calllogwebhook'], (req, res) => {
@@ -952,13 +962,13 @@ app.post(['/calllogwebhook'], (req, res) => {
   runInBackground(
     Promise.resolve().then(() => {
       const data = req.body || {};
-      const spUser = String(data.user || data.salesperson_number || '').replace(/\D+/g, '');
+      const spUser = normalizePhone(data.user || data.salesperson_number);
       const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
 
       for (const item of list) {
         if (!item || typeof item !== 'object') continue;
-        const user = String(item.user || spUser).replace(/\D+/g, '');
-        const number = String(item.number || item.customer_number || '').replace(/\D+/g, '');
+        const user = normalizePhone(item.user) || spUser;
+        const number = normalizePhone(item.number || item.customer_number);
         const timestamp = Number(item.timestamp || item.call_timestamp || 0);
         if (user && number && timestamp) {
           callLogQueue.push({
