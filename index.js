@@ -643,69 +643,6 @@ app.post('/send_mail', (req, res) => {
   runInBackground(sendMailJob(ordersIn, type));
 });
 
-// memory mein last historyId (Firebase nahi)
-let lastHistoryId = '';
-let isProcessingGmail = false;
-let pendingMailQueue = [];
-let mailFlushTimer = null;
-let isFlushingMail = false;
-
-function queueMailMessagesForWordPress(newMessages, emailAddress, newestHistoryId) {
-  if (!Array.isArray(newMessages) || !newMessages.length) return;
-
-  const existingIds = new Set(pendingMailQueue.map((m) => m.msg_id));
-  for (const msg of newMessages) {
-    if (msg && msg.msg_id && !existingIds.has(msg.msg_id)) {
-      pendingMailQueue.push(msg);
-      existingIds.add(msg.msg_id);
-    }
-  }
-
-  // Schedule 1-minute batch flush to restinfoot WordPress webhook
-  if (!mailFlushTimer && pendingMailQueue.length > 0) {
-    mailFlushTimer = setTimeout(() => {
-      mailFlushTimer = null;
-      runInBackground(flushMailQueueToWordPress(emailAddress, newestHistoryId));
-    }, 60000);
-  }
-}
-
-async function flushMailQueueToWordPress(emailAddress, newestHistoryId) {
-  if (isFlushingMail || !pendingMailQueue.length) return;
-  isFlushingMail = true;
-
-  const messagesToSend = [...pendingMailQueue];
-  pendingMailQueue = [];
-
-  try {
-    console.log(`[gmailwebhook] Flushing batch of ${messagesToSend.length} mail messages to WordPress...`);
-    const wpRes = await fetch(WP_HOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        source: 'node-gmail',
-        emailAddress: emailAddress || MY_EMAIL,
-        historyId: newestHistoryId || lastHistoryId,
-        messages: messagesToSend,
-      }),
-    });
-    const wpText = await wpRes.text();
-    console.log(`[gmailwebhook] WordPress response status: ${wpRes.status}, body: ${wpText.substring(0, 200)}`);
-  } catch (wpErr) {
-    console.error('[gmailwebhook] wp hook error:', wpErr.message);
-    // Re-queue un-sent messages if request failed
-    pendingMailQueue.unshift(...messagesToSend);
-  } finally {
-    isFlushingMail = false;
-    if (pendingMailQueue.length > 0 && !mailFlushTimer) {
-      mailFlushTimer = setTimeout(() => {
-        mailFlushTimer = null;
-        runInBackground(flushMailQueueToWordPress(emailAddress, newestHistoryId));
-      }, 60000);
-    }
-  }
-}
-
 async function processGmailWebhook(historyId, emailAddress) {
   if (isProcessingGmail) {
     console.log('[gmailwebhook] Already processing a history batch, skipping concurrent run');
@@ -879,7 +816,28 @@ async function processGmailWebhook(historyId, emailAddress) {
     }
 
     if (messages.length) {
-      queueMailMessagesForWordPress(messages, emailAddress, newestHistoryId);
+      console.log(`[gmailwebhook] Sending ${messages.length} mail messages to WordPress...`);
+      try {
+        const wpRes = await fetch(WP_HOOK, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+          body: JSON.stringify({
+            source: 'node-gmail',
+            emailAddress: emailAddress || MY_EMAIL,
+            historyId: newestHistoryId || lastHistoryId,
+            messages,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        const wpText = await wpRes.text();
+        console.log(`[gmailwebhook] WP response status: ${wpRes.status}, body: ${wpText.substring(0, 100)}`);
+      } catch (wpErr) {
+        console.error('[gmailwebhook] wp hook error:', wpErr.message);
+      }
     }
   } catch (err) {
     console.error('[gmailwebhook] error', err.message);
@@ -888,7 +846,7 @@ async function processGmailWebhook(historyId, emailAddress) {
   }
 }
 
-// Pub/Sub → Gmail → Queue in Node → restinfoot POST every 1 min → Pub/Sub gets 200 OK immediately
+// Pub/Sub → Gmail → Instant 200 OK to Google Pub/Sub → Immediate Background Sync to Restinfoot
 app.post('/gmailwebhook', (req, res) => {
   try {
     let historyId = '';
@@ -907,10 +865,10 @@ app.post('/gmailwebhook', (req, res) => {
       return res.status(200).json({ success: false, message: 'no historyId' });
     }
 
-    // 1) Google Pub/Sub ko turant 200 OK return karo
+    // 1) Google Pub/Sub ko turant 200 OK return karo (0 ms delay)
     res.status(200).json({ success: true, message: 'accepted', historyId });
 
-    // 2) Background worker me Gmail history check & 1-minute batch queue me insert karo
+    // 2) Background worker me Gmail history fetch & instant WordPress POST execute karo
     runInBackground(processGmailWebhook(historyId, emailAddress));
   } catch (err) {
     console.error('[gmailwebhook] express error', err.message);
@@ -920,33 +878,68 @@ app.post('/gmailwebhook', (req, res) => {
   }
 });
 
-// Call Log Queue with Smart 2-Min Idle Debounce & 5-Min Max Cap Flush
+// Call Log Webhook: Firestore-backed 2-Minute Batch Queue (Reduces Restinfoot API Hits & Zero Memory Loss)
+const CALL_LOGS_COLLECTION = 'call_logs_queue';
 const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/node-webhook';
-let callLogQueue = [];
-let callLogDebounceTimer = null; // 2 min idle timer
-let callLogMaxTimer = null;      // 5 min max cap timer
+let callLogFlushTimer = null;
 
-async function sendCallLogsToWP() {
-  if (callLogDebounceTimer) { clearTimeout(callLogDebounceTimer); callLogDebounceTimer = null; }
-  if (callLogMaxTimer) { clearTimeout(callLogMaxTimer); callLogMaxTimer = null; }
-
-  if (!callLogQueue.length) return;
-  const logs = [...callLogQueue];
-  callLogQueue = [];
+async function flushCallLogsToWP() {
+  callLogFlushTimer = null;
   try {
+    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(300).get();
+    if (snapshot.empty) return;
+
+    const docs = snapshot.docs;
+    const logs = docs.map((doc) => {
+      const data = doc.data();
+      delete data.created_at;
+      return data;
+    });
+
+    console.log(`[calllogwebhook] Flushing batch of ${logs.length} call logs from Firestore to WordPress...`);
+
     const res = await fetch(WP_CALL_LOG_HOOK, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
       body: JSON.stringify({ source: 'node-call-log', logs }),
+      signal: AbortSignal.timeout(15000),
     });
+
     const text = await res.text();
-    console.log('[calllogwebhook] Sent batch of', logs.length, 'logs to WP, status:', res.status, text.substring(0, 100));
-    if (!res.ok) {
-      callLogQueue.unshift(...logs);
+    console.log('[calllogwebhook] WordPress batch status:', res.status, text.substring(0, 100));
+
+    if (res.ok) {
+      const batch = firestore.batch();
+      for (const doc of docs) {
+        batch.delete(doc.ref);
+      }
+      await batch.commit();
+      console.log(`[calllogwebhook] Cleared ${docs.length} sent logs from Firestore queue`);
     }
   } catch (err) {
-    console.error('[calllogwebhook] error', err.message, err.cause ? (err.cause.message || err.cause) : '');
-    callLogQueue.unshift(...logs);
+    console.error('[calllogwebhook] Flush error:', err.message);
+  }
+}
+
+async function sendCallLogsDirectly(logs) {
+  if (!Array.isArray(logs) || !logs.length) return;
+  try {
+    await fetch(WP_CALL_LOG_HOOK, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ source: 'node-call-log', logs }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (e) {
+    console.error('[calllogwebhook] Direct fallback send error:', e.message);
   }
 }
 
@@ -957,42 +950,56 @@ function normalizePhone(val) {
 }
 
 app.post(['/calllogwebhook'], (req, res) => {
-  res.status(200).json({ success: true, message: 'accepted' });
+  const data = req.body || {};
+  const spUser = normalizePhone(data.user || data.salesperson_number);
+  const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
 
-  runInBackground(
-    Promise.resolve().then(() => {
-      const data = req.body || {};
-      const spUser = normalizePhone(data.user || data.salesperson_number);
-      const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
+  const newLogs = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const user = normalizePhone(item.user) || spUser;
+    const number = normalizePhone(item.number || item.customer_number);
+    const timestamp = Number(item.timestamp || item.call_timestamp || 0);
+    if (user && number && timestamp) {
+      newLogs.push({
+        user,
+        number,
+        status: String(item.status || item.type || 'unknown'),
+        duration: Number(item.duration || 0),
+        timestamp,
+        created_at: Date.now(),
+      });
+    }
+  }
 
-      for (const item of list) {
-        if (!item || typeof item !== 'object') continue;
-        const user = normalizePhone(item.user) || spUser;
-        const number = normalizePhone(item.number || item.customer_number);
-        const timestamp = Number(item.timestamp || item.call_timestamp || 0);
-        if (user && number && timestamp) {
-          callLogQueue.push({
-            user,
-            number,
-            status: String(item.status || item.type || 'unknown'),
-            duration: Number(item.duration || 0),
-            timestamp,
-          });
+  // 1) Mobile client ko turant response (0 ms wait)
+  res.status(200).json({ success: true, message: 'accepted', count: newLogs.length });
+
+  // 2) Firestore mein queue persistent store karo + 2 min baad Restinfoot ko 1 batch mein bhej do
+  if (newLogs.length) {
+    runInBackground(
+      (async () => {
+        try {
+          const batch = firestore.batch();
+          for (const log of newLogs) {
+            const ref = firestore.collection(CALL_LOGS_COLLECTION).doc();
+            batch.set(ref, log);
+          }
+          await batch.commit();
+
+          // 2-minute batch timer
+          if (!callLogFlushTimer) {
+            callLogFlushTimer = setTimeout(() => {
+              runInBackground(flushCallLogsToWP());
+            }, 120000);
+          }
+        } catch (e) {
+          console.error('[calllogwebhook] Firestore batch error:', e.message);
+          sendCallLogsDirectly(newLogs);
         }
-      }
-
-      if (callLogQueue.length > 0) {
-        // 1) 2 min idle (debounce) timer — jab bhi naye hit aayenge ye reset hoga
-        if (callLogDebounceTimer) clearTimeout(callLogDebounceTimer);
-        callLogDebounceTimer = setTimeout(() => runInBackground(sendCallLogsToWP()), 120000);
-
-        // 2) 5 min max cap timer — agar continuous hits aate rahein to max 5 min me bhej dega
-        if (!callLogMaxTimer) {
-          callLogMaxTimer = setTimeout(() => runInBackground(sendCallLogsToWP()), 300000);
-        }
-      }
-    })
-  );
+      })()
+    );
+  }
 });
 
 const PORT = process.env.PORT || 3000;
