@@ -862,58 +862,9 @@ app.post('/gmailwebhook', async (req, res) => {
   }
 });
 
-// Call Log Webhook: Firestore Queue (Doc ID: user_number_timestamp) + 2-Minute Batch Flush
+// Call Log Webhook & Flush Webhook
 const CALL_LOGS_COLLECTION = 'call_logs_queue';
 const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/node-webhook';
-let callLogFlushTimer = null;
-let isFlushingCallLogs = false;
-
-async function flushCallLogsToWP() {
-  if (isFlushingCallLogs) return;
-  isFlushingCallLogs = true;
-  callLogFlushTimer = null;
-
-  try {
-    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(500).get();
-    if (snapshot.empty) return;
-
-    const docs = snapshot.docs;
-    const logs = docs.map((doc) => {
-      const data = doc.data();
-      delete data.created_at;
-      return data;
-    });
-
-    console.log(`[calllogwebhook] 2-Min Batch Flush: Sending batch of ${logs.length} call logs from Firestore to WordPress...`);
-
-    const res = await fetch(WP_CALL_LOG_HOOK, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      body: JSON.stringify({ source: 'node-call-log', logs }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    const text = await res.text();
-    console.log('[calllogwebhook] WordPress batch status:', res.status, text.substring(0, 100));
-
-    if (res.ok) {
-      const batch = firestore.batch();
-      for (const doc of docs) {
-        batch.delete(doc.ref);
-      }
-      await batch.commit();
-      console.log(`[calllogwebhook] Cleared ${docs.length} sent logs from Firestore queue`);
-    }
-  } catch (err) {
-    console.error('[calllogwebhook] Flush error:', err.message);
-  } finally {
-    isFlushingCallLogs = false;
-  }
-}
 
 function normalizePhone(val) {
   const digits = String(val || '').replace(/\D+/g, '');
@@ -921,63 +872,77 @@ function normalizePhone(val) {
   return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
-app.post(['/calllogwebhook'], (req, res) => {
-  const data = req.body || {};
-  const spUser = normalizePhone(data.user || data.salesperson_number);
-  const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
+// 1) POST /calllogwebhook: Data aya -> 0 index ko direct Firestore main set -> Simple Response
+app.post(['/calllogwebhook'], async (req, res) => {
+  try {
+    const data = req.body || {};
+    const spUser = normalizePhone(data.user || data.salesperson_number);
+    const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
+    const item = list[0] || {};
 
-  const newLogs = [];
-  for (const item of list) {
-    if (!item || typeof item !== 'object') continue;
     const user = normalizePhone(item.user) || spUser;
     const number = normalizePhone(item.number || item.customer_number);
     const timestamp = Number(item.timestamp || item.call_timestamp || 0);
+    const status = String(item.status || item.type || 'unknown');
+    const duration = Number(item.duration || 0);
+
     if (user && number && timestamp) {
-      newLogs.push({
+      const docId = `${user}_${number}_${timestamp}`;
+      await firestore.collection(CALL_LOGS_COLLECTION).doc(docId).set({
         user,
         number,
-        status: String(item.status || item.type || 'unknown'),
-        duration: Number(item.duration || 0),
+        status,
+        duration,
         timestamp,
-        created_at: Date.now(),
       });
+      return res.status(200).json({ success: true, message: 'saved', docId });
     }
+
+    return res.status(200).json({ success: false, message: 'invalid data' });
+  } catch (err) {
+    console.error('[calllogwebhook] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
   }
+});
 
-  // 1) Mobile client ko turant response (0 ms wait)
-  res.status(200).json({ success: true, message: 'accepted', count: newLogs.length });
+// 2) GET /flushwebhook: Firestore ki latest 300 entries get -> Restinfoot POST -> Loop main doc delete
+app.get(['/flushwebhook'], async (req, res) => {
+  try {
+    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(300).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0 });
+    }
 
-  // 2) Firestore Queue (Doc ID: user_number_timestamp) + 2-Minute Batch Timer Handle
-  if (newLogs.length) {
-    runInBackground(
-      (async () => {
-        try {
-          const batch = firestore.batch();
-          for (const log of newLogs) {
-            const docId = `${log.user}_${log.number}_${log.timestamp}`;
-            const ref = firestore.collection(CALL_LOGS_COLLECTION).doc(docId);
-            batch.set(ref, log, { merge: true });
-          }
-          await batch.commit();
-          console.log(`[calllogwebhook] Saved ${newLogs.length} logs to Firestore queue (docId: user_number_timestamp)`);
+    const docs = snapshot.docs;
+    const logs = docs.map((doc) => doc.data());
 
-          // 2-Minute Batch Timer Handle: Container un-freeze hone par agar 2 min beet chuke hain to instantly flush karega
-          const oldest = await firestore.collection(CALL_LOGS_COLLECTION).orderBy('created_at', 'asc').limit(1).get();
-          const oldestTime = !oldest.empty ? Number(oldest.docs[0].data().created_at || 0) : Date.now();
+    console.log(`[flushwebhook] Posting ${logs.length} call logs to WordPress...`);
 
-          if (oldestTime && Date.now() - oldestTime >= 120000) {
-            console.log('[calllogwebhook] Next API call triggered & 2 mins passed since first log: Flushing batch immediately!');
-            await flushCallLogsToWP();
-          } else if (!callLogFlushTimer) {
-            callLogFlushTimer = setTimeout(() => {
-              runInBackground(flushCallLogsToWP());
-            }, 120000); // 2 Minutes
-          }
-        } catch (e) {
-          console.error('[calllogwebhook] Firestore write error:', e.message);
-        }
-      })()
-    );
+    const wpRes = await fetch(WP_CALL_LOG_HOOK, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ source: 'node-call-log', logs }),
+    });
+
+    const wpText = await wpRes.text();
+    console.log('[flushwebhook] WordPress status:', wpRes.status, wpText.substring(0, 100));
+
+    if (wpRes.ok) {
+      // Loop main lagakar doc delete
+      for (const doc of docs) {
+        await doc.ref.delete();
+      }
+      return res.status(200).json({ success: true, message: 'flushed & deleted', count: docs.length, wp_status: wpRes.status });
+    }
+
+    return res.status(200).json({ success: false, message: 'WP post failed', wp_status: wpRes.status, wp_error: wpText });
+  } catch (err) {
+    console.error('[flushwebhook] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
   }
 });
 
