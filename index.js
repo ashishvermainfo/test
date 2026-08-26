@@ -946,6 +946,101 @@ app.get(['/flushwebhook'], async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Meta Leads Webhook & Sync Hook
+// ---------------------------------------------------------------------------
+const META_LEADS_COLLECTION = 'meta_leads_queue';
+const WP_META_LEADS_HOOK = 'https://restinfoot.com/wp-json/meta-leads/v1/receive';
+
+// 1) POST /meta-leads: Data from Google Sheets / webhook -> Firestore main save
+app.post(['/meta-leads', '/metaleadswebhook'], async (req, res) => {
+  try {
+    const data = req.body || {};
+    const list = Array.isArray(data.leads) ? data.leads : (Array.isArray(data) ? data : [data]);
+
+    let saved = 0;
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const meta_id = String(item.meta_id || '').trim();
+      if (!meta_id) continue;
+
+      const docId = meta_id;
+      const leadData = {
+        meta_id,
+        store: String(item.store || '').replace(/_/g, '').trim(),
+        store_name: String(item.store_name || '').trim(),
+        name: String(item.name || '').trim(),
+        phone_no: normalizePhone(String(item.phone_no || '').replace(/^p:\s*/i, '').trim()),
+        whats_no: normalizePhone(String(item.whats_no || '').replace(/^p:\s*/i, '').trim()),
+        state: String(item.state || '').trim(),
+        city: String(item.city || '').trim(),
+        createdAt: Date.now(),
+      };
+
+      await firestore.collection(META_LEADS_COLLECTION).doc(docId).set(leadData);
+      saved++;
+    }
+
+    return res.status(200).json({ success: true, message: 'saved', count: saved });
+  } catch (err) {
+    console.error('[metaleadswebhook] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
+// 2) GET /meta-sync: Firestore ki latest 300 entries get -> WordPress receive POST -> Loop main doc delete
+app.get(['/meta-sync', '/flush-meta-leads'], async (req, res) => {
+  try {
+    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(300).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0 });
+    }
+
+    const docs = snapshot.docs;
+    const leads = docs.map((doc) => {
+      const d = doc.data();
+      return {
+        meta_id: d.meta_id || doc.id,
+        store: d.store || 'no',
+        store_name: d.store_name || '',
+        name: d.name || '',
+        phone_no: d.phone_no || '',
+        whats_no: d.whats_no || '',
+        state: d.state || '',
+        city: d.city || '',
+      };
+    });
+
+    console.log(`[meta-sync] Posting ${leads.length} meta leads to WordPress...`);
+
+    const wpRes = await fetch(WP_META_LEADS_HOOK, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ source: 'node-meta-leads', leads }),
+    });
+
+    const wpText = await wpRes.text();
+    console.log('[meta-sync] WordPress status:', wpRes.status, wpText.substring(0, 100));
+
+    if (wpRes.ok) {
+      // Loop main lagakar doc delete
+      for (const doc of docs) {
+        await doc.ref.delete();
+      }
+      return res.status(200).json({ success: true, message: 'flushed & deleted', count: docs.length, wp_status: wpRes.status });
+    }
+
+    return res.status(200).json({ success: false, message: 'WP post failed', wp_status: wpRes.status, wp_error: wpText });
+  } catch (err) {
+    console.error('[meta-sync] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server is running on http://localhost:' + PORT);
