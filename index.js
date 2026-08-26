@@ -16,7 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ENV: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN (+ FIRESTORE_* already)
 const MY_EMAIL = 'restinfootwholesale2024@gmail.com';
-const WP_HOOK = 'https://restinfoot.com/wp-json/gmail/v1/webhook';
+const WP_HOOK = 'https://api.restinfoot.com/webhook/gmail-hook.php';
 
 const firestore = new Firestore({
   projectId: process.env.FIRESTORE_PROJECT_ID,
@@ -145,7 +145,7 @@ app.post('/storechat', async (req, res) => {
   }
 });
 
-const WP_DELHIVERY_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/delhivery_tracking';
+const WP_DELHIVERY_HOOK = 'https://api.restinfoot.com/webhook/delhivery-hook.php';
 
 /** Same as appcron copy: status + tracking_states + edd */
 async function delhiveryFetchAwb(awb) {
@@ -243,8 +243,8 @@ app.post('/dehlivery_tracking', (req, res) => {
   runInBackground(delhiveryTrackingJob(ordersIn, type));
 });
 
-const WP_AMAZON_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/amazon_tracking';
-const WP_XPRESSBEE_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/xpressbee_tracking';
+const WP_AMAZON_HOOK = 'https://api.restinfoot.com/webhook/amazon-hook.php';
+const WP_XPRESSBEE_HOOK = 'https://api.restinfoot.com/webhook/xpressbee-hook.php';
 
 /** Same as appcron copy amazon_api_get_tracker_status → status + edd */
 function amazonParseJsonMaybe(val) {
@@ -458,7 +458,7 @@ app.post('/xpressbee-tracking', (req, res) => {
   runInBackground(xpressbeeTrackingJob(ordersIn));
 });
 
-const WP_SEND_MAIL_HOOK = 'https://restinfoot.com/wp-json/appcron/v1/send_mail';
+const WP_SEND_MAIL_HOOK = 'https://api.restinfoot.com/webhook/send-mail-hook.php';
 const MAIL_FROM_NAME = 'vivek agarwal';
 
 function getGmailClient() {
@@ -732,16 +732,44 @@ app.post('/gmailwebhook', async (req, res) => {
 
       let html = '';
       let plain = '';
+      const atts = [];
+
       const walk = (part) => {
         if (!part) return;
-        const mime = String(part.mimeType || '');
-        if (part.body && part.body.data) {
+        const mime = String(part.mimeType || '').toLowerCase();
+        const headers = Array.isArray(part.headers) ? part.headers : [];
+        const getPartHdr = (hName) => {
+          const hn = hName.toLowerCase();
+          for (const h of headers) {
+            if (String(h.name || '').toLowerCase() === hn) return String(h.value || '');
+          }
+          return '';
+        };
+
+        const cidRaw = getPartHdr('Content-ID') || getPartHdr('X-Attachment-Id');
+        const cleanCid = cidRaw.replace(/^<|>$/g, '').trim();
+
+        // 1) Text / HTML body extraction
+        if (part.body && part.body.data && !part.filename && !cleanCid) {
           let s = String(part.body.data).replace(/-/g, '+').replace(/_/g, '/');
           while (s.length % 4) s += '=';
           const text = Buffer.from(s, 'base64').toString('utf8');
-          if (mime === 'text/html') html = html || text;
-          if (mime === 'text/plain') plain = plain || text;
+          if (mime === 'text/html') html = html ? (html + '<br>' + text) : text;
+          if (mime === 'text/plain') plain = plain ? (plain + '\n' + text) : text;
         }
+
+        // 2) Attachments & Inline Images extraction
+        if (part.filename || (part.body && part.body.attachmentId) || cleanCid) {
+          const fn = String(part.filename || cleanCid || 'attachment').trim();
+          atts.push({
+            id: String((part.body && part.body.attachmentId) || ''),
+            filename: fn,
+            mimeType: part.mimeType || 'application/octet-stream',
+            size: Number((part.body && part.body.size) || 0),
+            cid: cleanCid,
+          });
+        }
+
         for (const p of part.parts || []) walk(p);
       };
       walk(msg.payload);
@@ -752,21 +780,6 @@ app.post('/gmailwebhook', async (req, res) => {
           ? plain
           : plain.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
       }
-
-      const atts = [];
-      const walkAtt = (part) => {
-        if (!part) return;
-        if (part.filename && part.body && part.body.attachmentId) {
-          atts.push({
-            id: part.body.attachmentId,
-            filename: part.filename,
-            mimeType: part.mimeType || '',
-            size: Number(part.body.size || 0),
-          });
-        }
-        for (const p of part.parts || []) walkAtt(p);
-      };
-      walkAtt(msg.payload);
 
       const from = hdr('From');
       const to = hdr('To');
@@ -864,7 +877,7 @@ app.post('/gmailwebhook', async (req, res) => {
 
 // Call Log Webhook & Flush Webhook
 const CALL_LOGS_COLLECTION = 'call_logs_queue';
-const WP_CALL_LOG_HOOK = 'https://restinfoot.com/wp-json/call-log/v1/node-webhook';
+const WP_CALL_LOG_HOOK = 'https://api.restinfoot.com/webhook/call-log-hook.php';
 
 function normalizePhone(val) {
   const digits = String(val || '').replace(/\D+/g, '');
@@ -942,101 +955,6 @@ app.get(['/flushwebhook'], async (req, res) => {
     return res.status(200).json({ success: false, message: 'WP post failed', wp_status: wpRes.status, wp_error: wpText });
   } catch (err) {
     console.error('[flushwebhook] Error:', err.message);
-    return res.status(200).json({ success: false, error: err.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Meta Leads Webhook & Sync Hook
-// ---------------------------------------------------------------------------
-const META_LEADS_COLLECTION = 'meta_leads_queue';
-const WP_META_LEADS_HOOK = 'https://restinfoot.com/wp-json/meta-leads/v1/receive';
-
-// 1) POST /meta-leads: Data from Google Sheets / webhook -> Firestore main save
-app.post(['/meta-leads', '/metaleadswebhook'], async (req, res) => {
-  try {
-    const data = req.body || {};
-    const list = Array.isArray(data.leads) ? data.leads : (Array.isArray(data) ? data : [data]);
-
-    let saved = 0;
-    for (const item of list) {
-      if (!item || typeof item !== 'object') continue;
-      const meta_id = String(item.meta_id || '').trim();
-      if (!meta_id) continue;
-
-      const docId = meta_id;
-      const leadData = {
-        meta_id,
-        store: String(item.store || '').replace(/_/g, '').trim(),
-        store_name: String(item.store_name || '').trim(),
-        name: String(item.name || '').trim(),
-        phone_no: normalizePhone(String(item.phone_no || '').replace(/^p:\s*/i, '').trim()),
-        whats_no: normalizePhone(String(item.whats_no || '').replace(/^p:\s*/i, '').trim()),
-        state: String(item.state || '').trim(),
-        city: String(item.city || '').trim(),
-        createdAt: Date.now(),
-      };
-
-      await firestore.collection(META_LEADS_COLLECTION).doc(docId).set(leadData);
-      saved++;
-    }
-
-    return res.status(200).json({ success: true, message: 'saved', count: saved });
-  } catch (err) {
-    console.error('[metaleadswebhook] Error:', err.message);
-    return res.status(200).json({ success: false, error: err.message });
-  }
-});
-
-// 2) GET /meta-sync: Firestore ki latest 300 entries get -> WordPress receive POST -> Loop main doc delete
-app.get(['/meta-sync', '/flush-meta-leads'], async (req, res) => {
-  try {
-    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(300).get();
-    if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0 });
-    }
-
-    const docs = snapshot.docs;
-    const leads = docs.map((doc) => {
-      const d = doc.data();
-      return {
-        meta_id: d.meta_id || doc.id,
-        store: d.store || 'no',
-        store_name: d.store_name || '',
-        name: d.name || '',
-        phone_no: d.phone_no || '',
-        whats_no: d.whats_no || '',
-        state: d.state || '',
-        city: d.city || '',
-      };
-    });
-
-    console.log(`[meta-sync] Posting ${leads.length} meta leads to WordPress...`);
-
-    const wpRes = await fetch(WP_META_LEADS_HOOK, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      body: JSON.stringify({ source: 'node-meta-leads', leads }),
-    });
-
-    const wpText = await wpRes.text();
-    console.log('[meta-sync] WordPress status:', wpRes.status, wpText.substring(0, 100));
-
-    if (wpRes.ok) {
-      // Loop main lagakar doc delete
-      for (const doc of docs) {
-        await doc.ref.delete();
-      }
-      return res.status(200).json({ success: true, message: 'flushed & deleted', count: docs.length, wp_status: wpRes.status });
-    }
-
-    return res.status(200).json({ success: false, message: 'WP post failed', wp_status: wpRes.status, wp_error: wpText });
-  } catch (err) {
-    console.error('[meta-sync] Error:', err.message);
     return res.status(200).json({ success: false, error: err.message });
   }
 });
