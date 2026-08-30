@@ -175,7 +175,7 @@ async function delhiveryTrackingJob(ordersIn, type) {
   const out = [];
   for (const row of ordersIn) {
     if (!row || typeof row !== 'object') continue;
-    const orderId = Number(row.order_id || 0);
+    const orderId = String(row.order_id || '').trim();
     let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
     awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
     if (!orderId || !awbs.length) continue;
@@ -336,7 +336,7 @@ async function amazonTrackingJob(ordersIn) {
   const out = [];
   for (const row of ordersIn) {
     if (!row || typeof row !== 'object') continue;
-    const orderId = Number(row.order_id || 0);
+    const orderId = String(row.order_id || '').trim();
     let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
     awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
     if (!orderId || !awbs.length) continue;
@@ -418,7 +418,7 @@ async function xpressbeeTrackingJob(ordersIn) {
   const out = [];
   for (const row of ordersIn) {
     if (!row || typeof row !== 'object') continue;
-    const orderId = Number(row.order_id || 0);
+    const orderId = String(row.order_id || '').trim();
     let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
     awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
     if (!orderId || !awbs.length) continue;
@@ -504,7 +504,7 @@ function gmailHdr(headers, name) {
  * One mail via Gmail API (new | reply). Same idea as PHP send_mail_dispatch.
  */
 async function sendOneGmail(gmail, row) {
-  const orderId = Number(row.order_id || 0);
+  const orderId = String(row.order_id || '').trim();
   const toList = parseMailList(row.to);
   const ccList = parseMailList(row.cc);
   const bccList = parseMailList(row.bcc);
@@ -594,7 +594,7 @@ async function sendMailJob(ordersIn, type) {
       out.push(await sendOneGmail(gmail, row));
     } catch (e) {
       out.push({
-        order_id: Number(row.order_id || 0),
+        order_id: String(row.order_id || '').trim(),
         ok: false,
         thread_id: String(row.thread_id || ''),
         msg_id: '',
