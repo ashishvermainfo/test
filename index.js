@@ -921,7 +921,7 @@ app.post(['/calllogwebhook'], async (req, res) => {
 // 2) GET /flushwebhook: Firestore ki latest 300 entries get -> Restinfoot POST -> Loop main doc delete
 app.get(['/flushwebhook'], async (req, res) => {
   try {
-    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(300).get();
+    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(100).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
