@@ -959,6 +959,152 @@ app.get(['/flushwebhook'], async (req, res) => {
   }
 });
 
+// Meta Leads Webhook & Flush Leads
+const META_LEADS_COLLECTION = 'meta_leads_queue';
+const WP_META_LEAD_HOOK = 'https://api.restinfoot.com/webhook/meta-lead-hook.php';
+
+function extractLeadItem(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  let item = raw;
+  if (raw.entry && Array.isArray(raw.entry) && raw.entry[0]?.changes && Array.isArray(raw.entry[0].changes)) {
+    item = raw.entry[0].changes[0]?.value || raw;
+  }
+
+  const metaId = String(item.meta_id || item.id || item.leadgen_id || item.lead_id || '').trim();
+  const name = String(item.name || item.full_name || item.customer_name || '').trim();
+  const phoneNo = normalizePhone(item.phone_no || item.phone || item.mobile || item.phone_number || item.contact_no);
+  const whatsNo = normalizePhone(item.whats_no || item.whatsapp || item.whatsapp_no || item.whatsapp_number) || phoneNo;
+  const store = String(item.store || '').toLowerCase().trim() === 'yes' ? 'yes' : 'no';
+  const storeName = String(item.store_name || item.shop_name || item.business_name || '').trim();
+  const state = String(item.state || '').trim();
+  const city = String(item.city || '').trim();
+  const timestamp = item.timestamp || item.created_time || item.created_at || new Date().toISOString();
+
+  if (metaId || phoneNo) {
+    return {
+      meta_id: metaId || (phoneNo ? `${phoneNo}_${Date.now()}` : `${Date.now()}`),
+      name,
+      phone_no: phoneNo,
+      whats_no: whatsNo,
+      store,
+      store_name: storeName,
+      state,
+      city,
+      timestamp,
+      raw_payload: typeof item === 'object' ? item : {},
+    };
+  }
+  return null;
+}
+
+// 1) Meta Webhook Verification (for Meta Graph API App Webhooks)
+app.get(['/metaleadwebhook', '/metaleadswebhook', '/metalead'], (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode && token) {
+    if (mode === 'subscribe') {
+      return res.status(200).send(challenge);
+    }
+    return res.sendStatus(403);
+  }
+  return res.status(200).json({ success: true, message: 'Meta lead webhook endpoint is active' });
+});
+
+// 2) POST /metaleadwebhook: Lead aayi -> Firestore collection (meta_leads_queue) main save
+app.post(['/metaleadwebhook'], async (req, res) => {
+  try {
+    const data = req.body || {};
+    let items = [];
+
+    if (Array.isArray(data)) {
+      items = data;
+    } else if (Array.isArray(data.leads)) {
+      items = data.leads;
+    } else if (Array.isArray(data.entry)) {
+      items = [data];
+    } else {
+      items = [data];
+    }
+
+    const savedDocs = [];
+    for (const raw of items) {
+      const lead = extractLeadItem(raw);
+      if (lead && lead.meta_id) {
+        const docId = String(lead.meta_id);
+        await firestore.collection(META_LEADS_COLLECTION).doc(docId).set(lead);
+        savedDocs.push(docId);
+      }
+    }
+
+    if (savedDocs.length > 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'saved',
+        count: savedDocs.length,
+        docIds: savedDocs,
+      });
+    }
+
+    return res.status(200).json({ success: false, message: 'invalid or empty lead data' });
+  } catch (err) {
+    console.error('[metaleadwebhook] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
+// 3) GET /flushlead: Firestore ki 100 leads get -> WordPress meta-lead-hook POST -> Loop main doc delete
+app.get(['/flushlead'], async (req, res) => {
+  try {
+    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(100).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0 });
+    }
+
+    const docs = snapshot.docs;
+    const leads = docs.map((doc) => doc.data());
+
+    console.log(`[flushlead] Posting ${leads.length} meta leads to WordPress...`);
+
+    const wpRes = await fetch(WP_META_LEAD_HOOK, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ source: 'node-meta-lead', leads }),
+    });
+
+    const wpText = await wpRes.text();
+    console.log('[flushlead] WordPress status:', wpRes.status, wpText.substring(0, 100));
+
+    if (wpRes.ok) {
+      // Loop lagakar Firestore docs delete
+      for (const doc of docs) {
+        await doc.ref.delete();
+      }
+      return res.status(200).json({
+        success: true,
+        message: 'flushed & deleted',
+        count: docs.length,
+        wp_status: wpRes.status,
+      });
+    }
+
+    return res.status(200).json({
+      success: false,
+      message: 'WP post failed',
+      wp_status: wpRes.status,
+      wp_error: wpText,
+    });
+  } catch (err) {
+    console.error('[flushlead] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server is running on http://localhost:' + PORT);
