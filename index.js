@@ -918,19 +918,9 @@ app.post(['/calllogwebhook'], async (req, res) => {
   }
 });
 
-// 2) GET /flushwebhook: Firestore ki latest 300 entries get -> Restinfoot POST -> Loop main doc delete
-app.get(['/flushwebhook'], async (req, res) => {
+async function flushCallLogsBackground(docs, logs) {
   try {
-    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(10).get();
-    if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0 });
-    }
-
-    const docs = snapshot.docs;
-    const logs = docs.map((doc) => doc.data());
-
-    console.log(`[flushwebhook] Posting ${logs.length} call logs to WordPress...`);
-
+    console.log(`[flushwebhook] Posting ${logs.length} call logs to WordPress in background...`);
     const wpRes = await fetch(WP_CALL_LOG_HOOK, {
       method: 'POST',
       headers: {
@@ -945,14 +935,38 @@ app.get(['/flushwebhook'], async (req, res) => {
     console.log('[flushwebhook] WordPress status:', wpRes.status, wpText.substring(0, 100));
 
     if (wpRes.ok) {
-      // Loop main lagakar doc delete
       for (const doc of docs) {
         await doc.ref.delete();
       }
-      return res.status(200).json({ success: true, message: 'flushed & deleted', count: docs.length, wp_status: wpRes.status });
+      console.log(`[flushwebhook] Deleted ${docs.length} call log docs from Firestore`);
+    } else {
+      console.error('[flushwebhook] WP post failed:', wpRes.status, wpText);
+    }
+  } catch (err) {
+    console.error('[flushwebhook] Error in background:', err.message);
+  }
+}
+
+// 2) GET /flushwebhook: Firestore ki entries get -> Immediate response -> Restinfoot POST & Delete in background
+app.get(['/flushwebhook'], async (req, res) => {
+  try {
+    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(20).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
 
-    return res.status(200).json({ success: false, message: 'WP post failed', wp_status: wpRes.status, wp_error: wpText });
+    const docs = snapshot.docs;
+    const logs = docs.map((doc) => doc.data());
+
+    // Immediate response
+    res.status(200).json({
+      success: true,
+      message: 'flushing in background',
+      count: docs.length,
+    });
+
+    // Run sync & delete in background
+    runInBackground(flushCallLogsBackground(docs, logs));
   } catch (err) {
     console.error('[flushwebhook] Error:', err.message);
     return res.status(200).json({ success: false, error: err.message });
@@ -1040,19 +1054,9 @@ app.post(['/metaleadwebhook'], async (req, res) => {
   }
 });
 
-// 2) GET /flushlead: Firestore ki 100 leads get -> WordPress meta-lead-hook POST -> Loop main doc delete
-app.get(['/flushlead'], async (req, res) => {
+async function flushMetaLeadsBackground(docs, leads) {
   try {
-    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(10).get();
-    if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0 });
-    }
-
-    const docs = snapshot.docs;
-    const leads = docs.map((doc) => doc.data());
-
-    console.log(`[flushlead] Posting ${leads.length} meta leads to WordPress...`);
-
+    console.log(`[flushlead] Posting ${leads.length} meta leads to WordPress in background...`);
     const wpRes = await fetch(WP_META_LEAD_HOOK, {
       method: 'POST',
       headers: {
@@ -1067,24 +1071,38 @@ app.get(['/flushlead'], async (req, res) => {
     console.log('[flushlead] WordPress status:', wpRes.status, wpText.substring(0, 100));
 
     if (wpRes.ok) {
-      // Loop lagakar Firestore docs delete
       for (const doc of docs) {
         await doc.ref.delete();
       }
-      return res.status(200).json({
-        success: true,
-        message: 'flushed & deleted',
-        count: docs.length,
-        wp_status: wpRes.status,
-      });
+      console.log(`[flushlead] Deleted ${docs.length} meta lead docs from Firestore`);
+    } else {
+      console.error('[flushlead] WP post failed:', wpRes.status, wpText);
+    }
+  } catch (err) {
+    console.error('[flushlead] Error in background:', err.message);
+  }
+}
+
+// 2) GET /flushlead: Firestore ki leads get -> Immediate response -> WordPress meta-lead-hook POST & Delete in background
+app.get(['/flushlead'], async (req, res) => {
+  try {
+    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(10).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
 
-    return res.status(200).json({
-      success: false,
-      message: 'WP post failed',
-      wp_status: wpRes.status,
-      wp_error: wpText,
+    const docs = snapshot.docs;
+    const leads = docs.map((doc) => doc.data());
+
+    // Immediate response
+    res.status(200).json({
+      success: true,
+      message: 'flushing in background',
+      count: docs.length,
     });
+
+    // Run sync & delete in background
+    runInBackground(flushMetaLeadsBackground(docs, leads));
   } catch (err) {
     console.error('[flushlead] Error:', err.message);
     return res.status(200).json({ success: false, error: err.message });
