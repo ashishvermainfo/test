@@ -921,7 +921,7 @@ app.post(['/calllogwebhook'], async (req, res) => {
 // 2) GET /flushwebhook: Firestore ki latest 300 entries get -> Restinfoot POST -> Loop main doc delete
 app.get(['/flushwebhook'], async (req, res) => {
   try {
-    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(100).get();
+    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(10).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
@@ -1043,7 +1043,7 @@ app.post(['/metaleadwebhook'], async (req, res) => {
 // 2) GET /flushlead: Firestore ki 100 leads get -> WordPress meta-lead-hook POST -> Loop main doc delete
 app.get(['/flushlead'], async (req, res) => {
   try {
-    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(100).get();
+    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(10).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
