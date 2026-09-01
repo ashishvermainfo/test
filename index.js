@@ -998,21 +998,7 @@ function extractLeadItem(raw) {
   return null;
 }
 
-// 1) Meta Webhook Verification (for Meta Graph API App Webhooks)
-app.get(['/metaleadwebhook', '/metaleadswebhook', '/metalead'], (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode && token) {
-    if (mode === 'subscribe') {
-      return res.status(200).send(challenge);
-    }
-    return res.sendStatus(403);
-  }
-  return res.status(200).json({ success: true, message: 'Meta lead webhook endpoint is active' });
-});
-
-// 2) POST /metaleadwebhook: Lead aayi -> Firestore collection (meta_leads_queue) main save
+// 1) POST /metaleadwebhook: Lead aayi -> Firestore collection (meta_leads_queue) main save
 app.post(['/metaleadwebhook'], async (req, res) => {
   try {
     const data = req.body || {};
@@ -1054,7 +1040,7 @@ app.post(['/metaleadwebhook'], async (req, res) => {
   }
 });
 
-// 3) GET /flushlead: Firestore ki 100 leads get -> WordPress meta-lead-hook POST -> Loop main doc delete
+// 2) GET /flushlead: Firestore ki 100 leads get -> WordPress meta-lead-hook POST -> Loop main doc delete
 app.get(['/flushlead'], async (req, res) => {
   try {
     const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(100).get();
