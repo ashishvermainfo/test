@@ -914,8 +914,13 @@ app.post(['/calllogwebhook'], async (req, res) => {
     const user = normalizePhone(item.user) || spUser;
     const number = normalizePhone(item.number || item.customer_number);
     const timestamp = Number(item.timestamp || item.call_timestamp || 0);
-    const status = String(item.status || item.type || 'unknown');
+    const status = String(item.status || item.type || 'unknown').toLowerCase().trim();
     const duration = Number(item.duration || 0);
+
+    // Skip storing outgoing calls with 0 duration
+    if (status === 'outgoing' && duration <= 0) {
+      return res.status(200).json({ success: true, message: 'skipped (outgoing duration 0)' });
+    }
 
     if (user && number && timestamp) {
       const docId = `${user}_${number}_${timestamp}`;
@@ -939,27 +944,43 @@ app.post(['/calllogwebhook'], async (req, res) => {
 async function flushCallLogsBackground(docs, logs) {
   if (!docs || !docs.length || !logs || !logs.length) return;
   try {
-    console.log(`[flushwebhook] Posting ${logs.length} call logs to WordPress in background...`);
-    const wpRes = await fetch(WP_CALL_LOG_HOOK, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      body: JSON.stringify({ source: 'node-call-log', logs }),
+    // Filter out outgoing calls with duration 0 before sending to WordPress
+    const validLogs = logs.filter((log) => {
+      const status = String(log.status || log.type || '').toLowerCase().trim();
+      const duration = Number(log.duration || 0);
+      return !(status === 'outgoing' && duration <= 0);
     });
 
-    const wpText = await wpRes.text();
-    console.log('[flushwebhook] WordPress status:', wpRes.status, wpText.substring(0, 100));
+    if (validLogs.length > 0) {
+      console.log(`[flushwebhook] Posting ${validLogs.length} call logs (${logs.length - validLogs.length} outgoing 0-dur skipped) to WordPress in background...`);
+      const wpRes = await fetch(WP_CALL_LOG_HOOK, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        body: JSON.stringify({ source: 'node-call-log', logs: validLogs }),
+      });
 
-    if (wpRes.ok) {
+      const wpText = await wpRes.text();
+      console.log('[flushwebhook] WordPress status:', wpRes.status, wpText.substring(0, 100));
+
+      if (wpRes.ok) {
+        for (const doc of docs) {
+          await doc.ref.delete();
+        }
+        console.log(`[flushwebhook] Deleted ${docs.length} call log docs from Firestore (mudrafinance-a404e)`);
+      } else {
+        console.error('[flushwebhook] WP post failed:', wpRes.status, wpText);
+      }
+    } else {
+      // All docs in this batch are outgoing with 0 duration: skip WP post, directly delete from Firestore
+      console.log(`[flushwebhook] All ${docs.length} call logs are outgoing 0-dur. Deleting directly from Firestore...`);
       for (const doc of docs) {
         await doc.ref.delete();
       }
       console.log(`[flushwebhook] Deleted ${docs.length} call log docs from Firestore (mudrafinance-a404e)`);
-    } else {
-      console.error('[flushwebhook] WP post failed:', wpRes.status, wpText);
     }
   } catch (err) {
     console.error('[flushwebhook] Error in background:', err.message);
