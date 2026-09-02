@@ -1003,6 +1003,18 @@ function extractLeadItem(raw) {
     item = raw.entry[0].changes[0]?.value || raw;
   }
 
+  // Handle Facebook Lead Ads field_data array if present
+  if (Array.isArray(item.field_data)) {
+    const fd = {};
+    for (const f of item.field_data) {
+      if (f && f.name) {
+        const val = Array.isArray(f.values) ? f.values[0] : f.value || '';
+        fd[String(f.name).toLowerCase()] = val;
+      }
+    }
+    item = { ...item, ...fd };
+  }
+
   const metaId = String(item.meta_id || item.id || item.leadgen_id || item.lead_id || '').trim();
   const name = String(item.name || item.full_name || item.customer_name || '').trim();
   const phoneNo = normalizePhone(item.phone_no || item.phone || item.mobile || item.phone_number || item.contact_no);
