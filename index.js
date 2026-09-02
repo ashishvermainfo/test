@@ -937,6 +937,7 @@ app.post(['/calllogwebhook'], async (req, res) => {
 });
 
 async function flushCallLogsBackground(docs, logs) {
+  if (!docs || !docs.length || !logs || !logs.length) return;
   try {
     console.log(`[flushwebhook] Posting ${logs.length} call logs to WordPress in background...`);
     const wpRes = await fetch(WP_CALL_LOG_HOOK, {
@@ -1085,6 +1086,7 @@ app.post(['/metaleadwebhook'], async (req, res) => {
 });
 
 async function flushMetaLeadsBackground(docs, leads) {
+  if (!docs || !docs.length || !leads || !leads.length) return;
   try {
     console.log(`[flushlead] Posting ${leads.length} meta leads to WordPress in background...`);
     const wpRes = await fetch(WP_META_LEAD_HOOK, {
