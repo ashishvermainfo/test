@@ -875,7 +875,25 @@ app.post('/gmailwebhook', async (req, res) => {
   }
 });
 
-// Call Log Webhook & Flush Webhook
+// Call Log & Meta Leads Firestore (mudrafinance-a404e Service Account)
+const mudraServiceAccount = {
+  type: 'service_account',
+  project_id: 'mudrafinance-a404e',
+  private_key_id: '32acb338ddfa16da8d433c70a5430480275a525f',
+  private_key: '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC4ave8YL9/6qpR\nFqo8LF/IEAOL7+nmyPDMPlMGmccWWAJmWPqSkqWHdsOqdVBc3+OM3eQosTUS9s/H\nBv7wcX2Wv0vhjKv9qF+IcD6QWiN3CPwmrSJwsOIm9YEs63KCISk9mTBFsT71Kmd0\ncsVDuTw25w6qSXg0Rq8l+eJ70/zpD4AAvTQN6Sh7ZC23TfBLItUQnp2HNKbMBZU4\nPb1V04Ayu8pvA6epvzxV45ENVUnEReTRN4VDxWEtfzlhM7w3N2umOIIl4L4xhUUp\nxBTNCLo5shL6IbEyNC1kjCicy+usAiKHRaWKRfOF1N9uLR6qUj+wPrkLV2DsCCNT\newUVMKj1AgMBAAECggEADL7r31uqcJtV6SPRYTZJ6mhc7mOG/Xne1qbqExc2wM8V\nX2B/9Phos1uce1//TWP19KrzVXKl8ekYBC/yF8koPm57Ppv72Ry1eZcUY+Ku98+p\nqbymmDZJcxrdsi6Vq/PBx22aff6ZlNU48D3sb1lSlZLTmyZXxfkqqsvCAP/uR2c6\nH93Yr+3ML1A/yogwJKJhiJuiKh1HP4zxb/nfjbg/SPUYqyhsKJnxYygj+nQFsLCP\nBJKOizYvZJ2CBzzuUelJ6xxGul2cEMy336y6KmLte71TNMur1fpoLq8ji4BW7SxC\n9EKTdC3PQzNAvBFXtIUjFOR1SWBYfRl/Ctv3Vpu1QwKBgQDyxSdjdWF3uYaU2JUn\nEIeN/7976Aq6x1nrrWXuMiJiTXf/XzgudAYIAzAHwKu2jRz0LOHSp26ZpZs8VVHT\nah6dF1jKtiUE/jYkl7XJ2WcAE7z80xySbnM+UVhGwpEsWgjcjMOgc0cYDnE0qKix\nxcBtPDdakrIW+Ndeq8j4NnPALwKBgQDCd8AsHJ1GKEfYhaZoXdDuq/oTQIbnBqqI\nV6Xm1/fvHXNnH3H8q5Y4W8VcOIN5O7lN8kT2MQahZGcTIZZ7eats1/DvfqKTnu6r\nN1aPgIbcKbLLJU2Y+irIoypC27vW4z5cIe2BeO1Px9elf0nxEZ+p0JqIY5XIPk3l\nN8Knz53cGwKBgQCKaITQW3e6PnfQHLrMjsv51TlidyTG4CkQCMf4SXT4/pnPaoYp\nVdSqdMbJZLuBVGqRe5Uz+GlCB/y9JReFpRbXERx6VeY9NoG/0w69ickDbj1tFx9P\nDNF/Ufk2Pm9uDdbHhylxLMf3myRHlXC4CbpvjMkyRjhqiGyheOcXPFQ52QKBgCjV\nPjvE8l0l3hgf0BZABLvozoS2Wt0tsCcayFIVbRD/TRkNKEEWwl8pHeLEVw7gtIMi\naMqM9shyrZX9ynw4yv76xLN1EqwOhizbXMibAzY9ZzZyqb2CYfNpF1mci++OHaz4\nzscN3j6PRr+QX7VHrw/YJmqXBn9aXb7Qm4Xi+VGbAoGAAN++TIrR6yANBwGEAvGy\n0648O7A9Eyneur/UZGmtwUhO/751GtTSd+yijfvW1j3NI3Ies1ym8PKvmpJpkyB1\nvNjNVZh8mERrdYBMisFH/BHRGRn7SnMVX5nHVT7AlLzfh9QZ4SpschqPjJYs0FUI\nty3jsM7gFGPyJLK64CRHOHQ=\n-----END PRIVATE KEY-----\n',
+  client_email: 'firebase-adminsdk-fbsvc@mudrafinance-a404e.iam.gserviceaccount.com',
+};
+
+const mudraFirestore = new Firestore({
+  projectId: mudraServiceAccount.project_id,
+  credentials: {
+    type: mudraServiceAccount.type,
+    project_id: mudraServiceAccount.project_id,
+    client_email: mudraServiceAccount.client_email,
+    private_key: mudraServiceAccount.private_key,
+  },
+});
+
 const CALL_LOGS_COLLECTION = 'call_logs_queue';
 const WP_CALL_LOG_HOOK = 'https://api.restinfoot.com/webhook/call-log-hook.php';
 
@@ -885,7 +903,7 @@ function normalizePhone(val) {
   return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
-// 1) POST /calllogwebhook: Data aya -> 0 index ko direct Firestore main set -> Simple Response
+// 1) POST /calllogwebhook: Data aya -> 0 index ko direct Firestore (mudrafinance-a404e) main save
 app.post(['/calllogwebhook'], async (req, res) => {
   try {
     const data = req.body || {};
@@ -901,7 +919,7 @@ app.post(['/calllogwebhook'], async (req, res) => {
 
     if (user && number && timestamp) {
       const docId = `${user}_${number}_${timestamp}`;
-      await firestore.collection(CALL_LOGS_COLLECTION).doc(docId).set({
+      await mudraFirestore.collection(CALL_LOGS_COLLECTION).doc(docId).set({
         user,
         number,
         status,
@@ -938,7 +956,7 @@ async function flushCallLogsBackground(docs, logs) {
       for (const doc of docs) {
         await doc.ref.delete();
       }
-      console.log(`[flushwebhook] Deleted ${docs.length} call log docs from Firestore`);
+      console.log(`[flushwebhook] Deleted ${docs.length} call log docs from Firestore (mudrafinance-a404e)`);
     } else {
       console.error('[flushwebhook] WP post failed:', wpRes.status, wpText);
     }
@@ -950,7 +968,7 @@ async function flushCallLogsBackground(docs, logs) {
 // 2) GET /flushwebhook: Firestore ki entries get -> Immediate response -> Restinfoot POST & Delete in background
 app.get(['/flushwebhook'], async (req, res) => {
   try {
-    const snapshot = await firestore.collection(CALL_LOGS_COLLECTION).limit(20).get();
+    const snapshot = await mudraFirestore.collection(CALL_LOGS_COLLECTION).limit(20).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
@@ -973,7 +991,7 @@ app.get(['/flushwebhook'], async (req, res) => {
   }
 });
 
-// Meta Leads Webhook & Flush Leads
+// Meta Leads Webhook & Flush Leads (mudrafinance-a404e Firestore)
 const META_LEADS_COLLECTION = 'meta_leads_queue';
 const WP_META_LEAD_HOOK = 'https://api.restinfoot.com/webhook/meta-lead-hook.php';
 
@@ -1033,7 +1051,7 @@ app.post(['/metaleadwebhook'], async (req, res) => {
       const lead = extractLeadItem(raw);
       if (lead && lead.meta_id) {
         const docId = String(lead.meta_id);
-        await firestore.collection(META_LEADS_COLLECTION).doc(docId).set(lead);
+        await mudraFirestore.collection(META_LEADS_COLLECTION).doc(docId).set(lead);
         savedDocs.push(docId);
       }
     }
@@ -1074,7 +1092,7 @@ async function flushMetaLeadsBackground(docs, leads) {
       for (const doc of docs) {
         await doc.ref.delete();
       }
-      console.log(`[flushlead] Deleted ${docs.length} meta lead docs from Firestore`);
+      console.log(`[flushlead] Deleted ${docs.length} meta lead docs from Firestore (mudrafinance-a404e)`);
     } else {
       console.error('[flushlead] WP post failed:', wpRes.status, wpText);
     }
@@ -1086,7 +1104,7 @@ async function flushMetaLeadsBackground(docs, leads) {
 // 2) GET /flushlead: Firestore ki leads get -> Immediate response -> WordPress meta-lead-hook POST & Delete in background
 app.get(['/flushlead'], async (req, res) => {
   try {
-    const snapshot = await firestore.collection(META_LEADS_COLLECTION).limit(10).get();
+    const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(10).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
