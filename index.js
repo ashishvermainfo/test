@@ -1118,7 +1118,7 @@ async function flushMetaLeadsBackground(docs, leads) {
 // 2) GET /flushlead: Firestore ki leads get -> Immediate response -> WordPress meta-lead-hook POST & Delete in background
 app.get(['/flushlead'], async (req, res) => {
   try {
-    const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(10).get();
+    const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(20).get();
     if (snapshot.empty) {
       return res.status(200).json({ success: true, message: 'empty', count: 0 });
     }
