@@ -155,13 +155,21 @@ async function delhiveryFetchAwb(awb) {
     headers: { origin: 'https://www.delhivery.com', Accept: 'application/json' },
   });
   const data = await res.json().catch(() => null);
-  if (!data || !data.data || !data.data[0] || !data.data[0].status) {
+  if (!data || !data.data || !data.data[0] || (!data.data[0].status && !data.data[0].hqStatus)) {
     return { awb, status: '', tracking_states: [], edd: '', error: 'Invalid API response' };
   }
   const row = data.data[0];
+  const status = String(
+    (row.status && typeof row.status === 'object' && row.status.status) ||
+    (typeof row.status === 'string' && row.status) ||
+    row.hqStatus ||
+    (row.status && (row.status.instructions || row.status.statusType)) ||
+    ''
+  ).trim();
+
   return {
     awb,
-    status: String((row.status && row.status.status) || ''),
+    status,
     tracking_states: Array.isArray(row.trackingStates) ? row.trackingStates : [],
     edd: String(row.promiseDeliveryDate || ''),
   };
