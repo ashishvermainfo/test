@@ -1005,12 +1005,16 @@ async function flushCallLogsBackground(docs, logs) {
   }
 }
 
-// 2) GET /flushwebhook: Firestore ki entries get -> Immediate response -> Restinfoot POST & Delete in background
-app.get(['/flushwebhook'], async (req, res) => {
+// 2) GET /flushwebhook & /flushcall: Firestore ki entries get -> Immediate response -> Restinfoot POST & Delete in background
+app.get(['/flushwebhook', '/flushcall', '/flushwebhook/:count', '/flushcall/:count'], async (req, res) => {
   try {
-    const snapshot = await mudraFirestore.collection(CALL_LOGS_COLLECTION).limit(20).get();
+    const rawCount = req.query.count ?? req.params.count;
+    const parsedCount = parseInt(rawCount, 10);
+    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+
+    const snapshot = await mudraFirestore.collection(CALL_LOGS_COLLECTION).limit(limitCount).get();
     if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0 });
+      return res.status(200).json({ success: true, message: 'empty', count: 0, limit: limitCount });
     }
 
     const docs = snapshot.docs;
@@ -1021,6 +1025,7 @@ app.get(['/flushwebhook'], async (req, res) => {
       success: true,
       message: 'flushing in background',
       count: docs.length,
+      limit: limitCount,
     });
 
     // Run sync & delete in background
@@ -1154,12 +1159,16 @@ async function flushMetaLeadsBackground(docs, leads) {
   }
 }
 
-// 2) GET /flushlead: Firestore ki leads get -> Immediate response -> WordPress meta-lead-hook POST & Delete in background
-app.get(['/flushlead'], async (req, res) => {
+// 2) GET /flushlead & /flushleads: Firestore ki leads get -> Immediate response -> WordPress meta-lead-hook POST & Delete in background
+app.get(['/flushlead', '/flushleads', '/flushlead/:count', '/flushleads/:count'], async (req, res) => {
   try {
-    const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(20).get();
+    const rawCount = req.query.count ?? req.params.count;
+    const parsedCount = parseInt(rawCount, 10);
+    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+
+    const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(limitCount).get();
     if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0 });
+      return res.status(200).json({ success: true, message: 'empty', count: 0, limit: limitCount });
     }
 
     const docs = snapshot.docs;
@@ -1170,6 +1179,7 @@ app.get(['/flushlead'], async (req, res) => {
       success: true,
       message: 'flushing in background',
       count: docs.length,
+      limit: limitCount,
     });
 
     // Run sync & delete in background
