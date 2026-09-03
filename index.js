@@ -159,13 +159,23 @@ async function delhiveryFetchAwb(awb) {
     return { awb, status: '', tracking_states: [], edd: '', error: 'Invalid API response' };
   }
   const row = data.data[0];
-  const status = String(
+  let status = String(
     (row.status && typeof row.status === 'object' && row.status.status) ||
     (typeof row.status === 'string' && row.status) ||
     row.hqStatus ||
     (row.status && (row.status.instructions || row.status.statusType)) ||
     ''
   ).trim();
+
+  if (/^in[\s_-]?transit$/i.test(status)) {
+    status = 'IN_TRANSIT';
+  } else if (/^(out[\s_-]?for[\s_-]?delivery|out[\s_-]?delivery|ofd)$/i.test(status)) {
+    status = 'OUT_DELIVERY';
+  } else if (/^delivered$/i.test(status)) {
+    status = 'DELIVERED';
+  } else if (/^(reached[\s_-]?dest|reached[\s_-]?destination)/i.test(status)) {
+    status = 'REACHED_DEST_CITY';
+  }
 
   return {
     awb,
