@@ -531,6 +531,7 @@ async function sendOneGmail(gmail, row) {
 
   const base = {
     order_id: orderId,
+    order_ids: Array.isArray(row.order_ids) ? row.order_ids : [],
     courier,
     meta,
     mail_type: mailType,
@@ -606,6 +607,7 @@ async function sendMailJob(ordersIn, type) {
     } catch (e) {
       out.push({
         order_id: String(row.order_id || '').trim(),
+        order_ids: Array.isArray(row.order_ids) ? row.order_ids : [],
         ok: false,
         thread_id: String(row.thread_id || ''),
         msg_id: '',
