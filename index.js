@@ -916,42 +916,57 @@ function normalizePhone(val) {
   return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
-// 1) POST /calllogwebhook: Data aya -> 0 index ko direct Firestore (mudrafinance-a404e) main save
-app.post(['/calllogwebhook'], async (req, res) => {
+async function saveCallLogsToFirestore(list, spUser) {
   try {
-    const data = req.body || {};
-    const spUser = normalizePhone(data.user || data.salesperson_number);
-    const list = Array.isArray(data.calls) ? data.calls : Array.isArray(data.logs) ? data.logs : [data];
-    const item = list[0] || {};
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
 
-    const user = normalizePhone(item.user) || spUser;
-    const number = normalizePhone(item.number || item.customer_number);
-    const timestamp = Number(item.timestamp || item.call_timestamp || 0);
-    const status = String(item.status || item.type || 'unknown').toLowerCase().trim();
-    const duration = Number(item.duration || 0);
+      const user = normalizePhone(item.user || item.salesperson_number) || spUser;
+      const number = normalizePhone(item.number || item.customer_number);
+      const timestamp = Number(item.timestamp || item.call_timestamp || 0);
+      const status = String(item.status || item.type || 'unknown').toLowerCase().trim();
+      const duration = Number(item.duration || 0);
 
-    // Skip storing outgoing calls with 0 duration
-    if (status === 'outgoing' && duration <= 0) {
-      return res.status(200).json({ success: true, message: 'skipped (outgoing duration 0)' });
+      // Skip storing outgoing calls with 0 duration
+      if (status === 'outgoing' && duration <= 0) {
+        continue;
+      }
+
+      if (user && number && timestamp) {
+        const docId = `${user}_${number}_${timestamp}`;
+        await mudraFirestore.collection(CALL_LOGS_COLLECTION).doc(docId).set({
+          user,
+          number,
+          status,
+          duration,
+          timestamp,
+        });
+      }
     }
-
-    if (user && number && timestamp) {
-      const docId = `${user}_${number}_${timestamp}`;
-      await mudraFirestore.collection(CALL_LOGS_COLLECTION).doc(docId).set({
-        user,
-        number,
-        status,
-        duration,
-        timestamp,
-      });
-      return res.status(200).json({ success: true, message: 'saved', docId });
-    }
-
-    return res.status(200).json({ success: false, message: 'invalid data' });
   } catch (err) {
-    console.error('[calllogwebhook] Error:', err.message);
-    return res.status(200).json({ success: false, error: err.message });
+    console.error('[calllogwebhook] Error saving to Firestore:', err.message);
   }
+}
+
+// 1) POST /calllogwebhook: Immediate response -> runInBackground main Firestore save
+app.post(['/calllogwebhook'], (req, res) => {
+  const data = req.body || {};
+  const spUser = normalizePhone(data.user || data.salesperson_number);
+  const list = Array.isArray(data.calls)
+    ? data.calls
+    : Array.isArray(data.logs)
+      ? data.logs
+      : Array.isArray(data)
+        ? data
+        : [data];
+
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: list.length,
+  });
+
+  runInBackground(saveCallLogsToFirestore(list, spUser));
 });
 
 async function flushCallLogsBackground(docs, logs) {
