@@ -1015,36 +1015,79 @@ async function flushCallLogsBackground(docs, logs) {
   }
 }
 
-// 2) GET /flushwebhook & /flushcall: Firestore ki entries get -> Immediate response -> Restinfoot POST & Delete in background
-app.get(['/flushwebhook', '/flushcall', '/flushwebhook/:count', '/flushcall/:count'], async (req, res) => {
-  try {
-    const rawCount = req.query.count ?? req.params.count;
-    const parsedCount = parseInt(rawCount, 10);
-    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+// 2) GET & POST /flushwebhook & /flushcall: Firestore ki entries get (with optional user phone & count) -> Immediate response -> Restinfoot POST & Delete in background
+app.all(
+  [
+    '/flushwebhook',
+    '/flushcall',
+    '/flushwebhook/:count',
+    '/flushcall/:count',
+    '/flushwebhook/:user/:count',
+    '/flushcall/:user/:count',
+  ],
+  async (req, res) => {
+    try {
+      const rawCount = req.query.count ?? req.query.limit ?? req.body?.count ?? req.body?.limit ?? req.params.count;
+      let parsedCount = parseInt(rawCount, 10);
 
-    const snapshot = await mudraFirestore.collection(CALL_LOGS_COLLECTION).limit(limitCount).get();
-    if (snapshot.empty) {
-      return res.status(200).json({ success: true, message: 'empty', count: 0, limit: limitCount });
+      const rawUser =
+        req.query.user ??
+        req.query.phone ??
+        req.query.user_phone ??
+        req.query.salesperson_number ??
+        req.query.salesperson_phone ??
+        req.body?.user ??
+        req.body?.phone ??
+        req.body?.user_phone ??
+        req.params.user;
+
+      let user = normalizePhone(rawUser);
+
+      // If count param contains a 10-digit phone (e.g. /flushcall/9876543210)
+      if (!user && req.params.count && String(req.params.count).length >= 10) {
+        user = normalizePhone(req.params.count);
+        parsedCount = NaN;
+      }
+
+      const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+
+      let query = mudraFirestore.collection(CALL_LOGS_COLLECTION);
+      if (user) {
+        query = query.where('user', '==', user);
+      }
+      query = query.limit(limitCount);
+
+      const snapshot = await query.get();
+      if (snapshot.empty) {
+        return res.status(200).json({
+          success: true,
+          message: 'empty',
+          count: 0,
+          user: user || null,
+          limit: limitCount,
+        });
+      }
+
+      const docs = snapshot.docs;
+      const logs = docs.map((doc) => doc.data());
+
+      // Immediate response
+      res.status(200).json({
+        success: true,
+        message: 'flushing in background',
+        count: docs.length,
+        user: user || null,
+        limit: limitCount,
+      });
+
+      // Run sync & delete in background
+      runInBackground(flushCallLogsBackground(docs, logs));
+    } catch (err) {
+      console.error('[flushwebhook] Error:', err.message);
+      return res.status(200).json({ success: false, error: err.message });
     }
-
-    const docs = snapshot.docs;
-    const logs = docs.map((doc) => doc.data());
-
-    // Immediate response
-    res.status(200).json({
-      success: true,
-      message: 'flushing in background',
-      count: docs.length,
-      limit: limitCount,
-    });
-
-    // Run sync & delete in background
-    runInBackground(flushCallLogsBackground(docs, logs));
-  } catch (err) {
-    console.error('[flushwebhook] Error:', err.message);
-    return res.status(200).json({ success: false, error: err.message });
   }
-});
+);
 
 // Meta Leads Webhook & Flush Leads (mudrafinance-a404e Firestore)
 const META_LEADS_COLLECTION = 'meta_leads_queue';
