@@ -1049,7 +1049,7 @@ app.all(
         parsedCount = NaN;
       }
 
-      const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+      const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 10;
 
       let query = mudraFirestore.collection(CALL_LOGS_COLLECTION);
       if (user) {
@@ -1217,7 +1217,7 @@ app.get(['/flushlead', '/flushleads', '/flushlead/:count', '/flushleads/:count']
   try {
     const rawCount = req.query.count ?? req.params.count;
     const parsedCount = parseInt(rawCount, 10);
-    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 20;
+    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 10;
 
     const snapshot = await mudraFirestore.collection(META_LEADS_COLLECTION).limit(limitCount).get();
     if (snapshot.empty) {
