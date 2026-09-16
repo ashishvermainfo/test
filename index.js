@@ -1377,7 +1377,7 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
   try {
     const rawCount = req.query.count ?? req.params.count;
     const parsedCount = parseInt(rawCount, 10);
-    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 50;
+    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 10;
 
     const snapshot = await mudraFirestore.collection(JOB_LEADS_COLLECTION).limit(limitCount).get();
     if (snapshot.empty) {
