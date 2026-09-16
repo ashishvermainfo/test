@@ -1243,6 +1243,166 @@ app.get(['/flushlead', '/flushleads', '/flushlead/:count', '/flushleads/:count']
   }
 });
 
+// ==========================================
+// Job Leads Webhook & Flush Leads (mudrafinance-a404e Firestore)
+// ==========================================
+const JOB_LEADS_COLLECTION = 'job_leads_queue';
+const WP_JOB_LEAD_HOOK = 'https://api.restinfoot.com/webhook/job-lead-hook.php';
+
+function extractJobLeadItem(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  let item = raw;
+  if (raw.entry && Array.isArray(raw.entry) && raw.entry[0]?.changes && Array.isArray(raw.entry[0].changes)) {
+    item = raw.entry[0].changes[0]?.value || raw;
+  }
+
+  // Handle Facebook Lead Ads field_data array if present
+  if (Array.isArray(item.field_data)) {
+    const fd = {};
+    for (const f of item.field_data) {
+      if (f && f.name) {
+        const val = Array.isArray(f.values) ? f.values[0] : f.value || '';
+        fd[String(f.name).toLowerCase()] = val;
+      }
+    }
+    item = { ...item, ...fd };
+  }
+
+  const cleanYn = (v) => (String(v || '').toLowerCase().trim() === 'yes' ? 'yes' : 'no');
+
+  const metaId = String(item.meta_id || item.id || item.leadgen_id || item.lead_id || '').trim();
+  const name = String(item.name || item.full_name || item.customer_name || '').trim();
+  const phoneNo = normalizePhone(item.phone_no || item.phone || item.mobile || item.phone_number || item.contact_no);
+  const whatsNo = normalizePhone(item.whats_no || item.whatsapp || item.whatsapp_no || item.whatsapp_number) || phoneNo;
+  const agra = cleanYn(item.agra);
+  const footwear = cleanYn(item.footwear_knowlegde || item.footwear_knowledge || item.footwear);
+  const sale = cleanYn(item.sale_expirance || item.sales_experience || item.sales);
+  const comm = cleanYn(item.skill_comunication || item.skill_communication || item.communication);
+  const comp = cleanYn(item.skill_computer || item.computer_skill || item.computer);
+  const timestamp = item.timestamp || item.created_time || item.created_at || new Date().toISOString();
+
+  if (metaId || phoneNo) {
+    return {
+      meta_id: metaId || (phoneNo ? `${phoneNo}_${Date.now()}` : `${Date.now()}`),
+      name,
+      phone_no: phoneNo,
+      whats_no: whatsNo,
+      agra,
+      footwear_knowlegde: footwear,
+      sale_expirance: sale,
+      skill_comunication: comm,
+      skill_computer: comp,
+      timestamp,
+      raw_payload: typeof item === 'object' ? item : {},
+    };
+  }
+  return null;
+}
+
+// 1) POST /jobleadhook: Job lead aayi -> Firestore collection (job_leads_queue) main save
+app.post(['/jobleadhook', '/jobleadwebhook'], async (req, res) => {
+  try {
+    const data = req.body || {};
+    let items = [];
+
+    if (Array.isArray(data)) {
+      items = data;
+    } else if (Array.isArray(data.leads)) {
+      items = data.leads;
+    } else if (Array.isArray(data.entry)) {
+      items = [data];
+    } else {
+      items = [data];
+    }
+
+    const savedDocs = [];
+    for (const raw of items) {
+      const lead = extractJobLeadItem(raw);
+      if (lead && lead.meta_id) {
+        const docId = String(lead.meta_id);
+        await mudraFirestore.collection(JOB_LEADS_COLLECTION).doc(docId).set(lead);
+        savedDocs.push(docId);
+      }
+    }
+
+    if (savedDocs.length > 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'saved',
+        count: savedDocs.length,
+        docIds: savedDocs,
+      });
+    }
+
+    return res.status(200).json({ success: false, message: 'invalid or empty lead data' });
+  } catch (err) {
+    console.error('[jobleadhook] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
+async function flushJobLeadsBackground(docs, leads) {
+  if (!docs || !docs.length || !leads || !leads.length) return;
+  try {
+    console.log(`[flushjoblead] Posting ${leads.length} job leads to WordPress in background...`);
+    const wpRes = await fetch(WP_JOB_LEAD_HOOK, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify({ source: 'node-job-lead', leads }),
+    });
+
+    const wpText = await wpRes.text();
+    console.log('[flushjoblead] WordPress status:', wpRes.status, wpText.substring(0, 100));
+
+    if (wpRes.ok) {
+      for (const doc of docs) {
+        await doc.ref.delete();
+      }
+      console.log(`[flushjoblead] Deleted ${docs.length} job lead docs from Firestore (mudrafinance-a404e)`);
+    } else {
+      console.error('[flushjoblead] WP post failed:', wpRes.status, wpText);
+    }
+  } catch (err) {
+    console.error('[flushjoblead] Error in background:', err.message);
+  }
+}
+
+// 2) GET /flushjoblead & /flushjobleads: Firestore ki job leads get -> Immediate response -> WordPress job-lead-hook POST & Delete in background
+app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjobleads/:count'], async (req, res) => {
+  try {
+    const rawCount = req.query.count ?? req.params.count;
+    const parsedCount = parseInt(rawCount, 10);
+    const limitCount = Number.isInteger(parsedCount) && parsedCount > 0 ? parsedCount : 50;
+
+    const snapshot = await mudraFirestore.collection(JOB_LEADS_COLLECTION).limit(limitCount).get();
+    if (snapshot.empty) {
+      return res.status(200).json({ success: true, message: 'empty', count: 0, limit: limitCount });
+    }
+
+    const docs = snapshot.docs;
+    const leads = docs.map((doc) => doc.data());
+
+    // Immediate response
+    res.status(200).json({
+      success: true,
+      message: 'flushing in background',
+      count: docs.length,
+      limit: limitCount,
+    });
+
+    // Run sync & delete in background
+    runInBackground(flushJobLeadsBackground(docs, leads));
+  } catch (err) {
+    console.error('[flushjoblead] Error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server is running on http://localhost:' + PORT);
