@@ -1593,6 +1593,115 @@ app.post(['/app-cart', '/app-cart-notification'], (req, res) => {
   }
 });
 
+// -------------------------------------------------------------
+// GET / POST /test-onesignal: Debug & test OneSignal notification API directly
+// -------------------------------------------------------------
+app.all(['/test-onesignal', '/test-onesignal/:phone'], async (req, res) => {
+  const queryPhone = req.params.phone || req.query.phone || req.body?.phone || '8972726962';
+  const customKey = req.query.key || req.body?.key;
+  const customAppId = req.query.app_id || req.body?.app_id;
+  const isAll = req.query.all === 'true' || req.body?.all === true;
+
+  const targetPhone = String(queryPhone).replace(/\D+/g, '').slice(-10);
+  const externalIds = [targetPhone, `+91${targetPhone}`, `91${targetPhone}`];
+
+  const defaultAppId = customAppId || ONESIGNAL_APP_ID;
+  const rawKey = customKey || ONESIGNAL_AUTH;
+  const cleanKey = String(rawKey).trim().replace(/^(Basic|Key|Bearer)\s+/i, '');
+
+  const tests = [
+    {
+      name: 'onesignal.com / Basic Auth (Default)',
+      url: 'https://onesignal.com/api/v1/notifications',
+      auth: `Basic ${cleanKey}`,
+      app_id: defaultAppId,
+    },
+    {
+      name: 'onesignal.com / Key Auth',
+      url: 'https://onesignal.com/api/v1/notifications',
+      auth: `Key ${cleanKey}`,
+      app_id: defaultAppId,
+    },
+    {
+      name: 'api.onesignal.com / Key Auth',
+      url: 'https://api.onesignal.com/notifications',
+      auth: `Key ${cleanKey}`,
+      app_id: defaultAppId,
+    },
+    {
+      name: 'api.onesignal.com / Basic Auth',
+      url: 'https://api.onesignal.com/notifications',
+      auth: `Basic ${cleanKey}`,
+      app_id: defaultAppId,
+    },
+  ];
+
+  const results = [];
+  for (const t of tests) {
+    const payload = {
+      app_id: t.app_id,
+      headings: { en: 'Test Notification 🔔' },
+      contents: { en: `Testing OneSignal delivery to ${targetPhone} at ${new Date().toISOString()}` },
+      large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+      chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+      isAndroid: true,
+      isIos: true,
+    };
+
+    if (isAll) {
+      payload.included_segments = ['Subscribed Users'];
+    } else {
+      payload.include_external_user_ids = externalIds;
+    }
+
+    try {
+      const response = await fetch(t.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': t.auth,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const responseText = await response.text();
+      let responseJson = null;
+      try {
+        responseJson = JSON.parse(responseText);
+      } catch (_) {
+        responseJson = responseText;
+      }
+
+      const success = response.ok && (!responseJson?.errors || (Array.isArray(responseJson.errors) && responseJson.errors.length === 0));
+
+      results.push({
+        test: t.name,
+        endpoint: t.url,
+        auth_prefix: t.auth.split(' ')[0],
+        key_preview: cleanKey.slice(0, 15) + '...' + cleanKey.slice(-6),
+        status_code: response.status,
+        success: success,
+        response: responseJson,
+      });
+    } catch (err) {
+      results.push({
+        test: t.name,
+        endpoint: t.url,
+        error: err.message,
+      });
+    }
+  }
+
+  return res.status(200).json({
+    message: 'OneSignal Multi-Test Report',
+    target_phone: targetPhone,
+    app_id: defaultAppId,
+    key_preview: cleanKey.slice(0, 15) + '...' + cleanKey.slice(-6),
+    results: results,
+    hint: 'You can test any new key directly via query param: /test-onesignal?key=YOUR_NEW_KEY&phone=' + targetPhone,
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server is running on http://localhost:' + PORT);
