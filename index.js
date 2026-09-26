@@ -1403,6 +1403,191 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
   }
 });
 
+// -------------------------------------------------------------
+// POST /app-cart & /app-cart-notification: Send OneSignal push & Firestore SMS in background
+// -------------------------------------------------------------
+const ONESIGNAL_APP_ID = 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
+const ONESIGNAL_AUTH = 'Basic os_v2_app_xgrl5vnnbvglxkesvw5zsc4ktvmzvmez6dku2vvywaqn7vqqophal4ej3poukxgjwxme5e335yfwlxdxoiirebmfdngtomyodq6fzwq';
+
+async function processAppCartNotificationsBackground(items, options = {}) {
+  try {
+    if (!Array.isArray(items) || items.length === 0) {
+      console.log('[app-cart] No items to process in background');
+      return;
+    }
+
+    const title = options.title || 'Your Cart Is Waiting! 🛒';
+    const message = options.message || 'Your selected items are still in your cart. Complete your order before they\'re gone!';
+    const imageUrl = options.image_url || 'https://restinfoot.com/wp-content/uploads/2026/09/app-cart-banner.webp';
+    const buttonText = options.button_text || 'Complete Order';
+    const linkUrl = options.url || 'https://restinfoot.com/shop?checkout=true';
+    const smsBody = options.sms_body || 'You have items in your Restinfoot cart. Complete your order whenever you\'re ready.\n\nComplete order now\nhttps://restinfoot.com/shop?checkout=true';
+
+    // 1) OneSignal Notification to all customers
+    const customerPhones = new Set();
+    for (const item of items) {
+      const raw = String(item.customer_no || item.customer_phone || item.mobile || '').replace(/\D+/g, '');
+      let clean = raw;
+      if (clean.length === 12 && clean.startsWith('91')) {
+        clean = clean.slice(2);
+      }
+      if (clean.length === 10) {
+        customerPhones.add(clean);
+      }
+    }
+
+    if (customerPhones.size > 0) {
+      const expandedExternalIds = [];
+      for (const phone of customerPhones) {
+        expandedExternalIds.push(phone);
+        expandedExternalIds.push(`+91${phone}`);
+        expandedExternalIds.push(`91${phone}`);
+      }
+
+      const CHUNK_SIZE = 1500;
+      for (let i = 0; i < expandedExternalIds.length; i += CHUNK_SIZE) {
+        const chunk = expandedExternalIds.slice(i, i + CHUNK_SIZE);
+        const payload = {
+          app_id: ONESIGNAL_APP_ID,
+          include_external_user_ids: chunk,
+          headings: { en: title },
+          contents: { en: message },
+          large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+          chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+          url: linkUrl,
+          isAndroid: true,
+          isIos: true,
+        };
+
+        if (imageUrl) {
+          payload.big_picture = imageUrl;
+          payload.ios_attachments = { id1: imageUrl };
+          payload.chrome_web_image = imageUrl;
+        }
+
+        if (buttonText) {
+          payload.buttons = [{ id: 'checkout', text: buttonText }];
+        }
+
+        try {
+          const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: ONESIGNAL_AUTH,
+            },
+            body: JSON.stringify(payload),
+          });
+          const osData = await osRes.json();
+          console.log('[app-cart] OneSignal response:', osRes.status, osData);
+        } catch (osErr) {
+          console.error('[app-cart] OneSignal error:', osErr.message);
+        }
+      }
+    } else {
+      console.log('[app-cart] No valid customer phones for OneSignal');
+    }
+
+    // 2) SMS send via Firestore with 1 sec delay between repeat sends for the SAME salesperson
+    const spMap = {};
+    const seenPairs = new Set();
+
+    for (const item of items) {
+      const spRaw = String(item.salesperson_no || item.salesperson_phone || item.phone_no || '').replace(/\D+/g, '');
+      const custRaw = String(item.customer_no || item.customer_phone || item.mobile || '').replace(/\D+/g, '');
+
+      let sp = spRaw;
+      if (sp.length === 12 && sp.startsWith('91')) sp = sp.slice(2);
+
+      let cust = custRaw;
+      if (cust.length === 12 && cust.startsWith('91')) cust = cust.slice(2);
+
+      if (sp.length === 10 && cust.length === 10) {
+        const pairKey = `${sp}_${cust}`;
+        if (!seenPairs.has(pairKey)) {
+          seenPairs.add(pairKey);
+          if (!spMap[sp]) {
+            spMap[sp] = [];
+          }
+          spMap[sp].push(cust);
+        }
+      }
+    }
+
+    const spList = Object.keys(spMap);
+    let maxRounds = 0;
+    for (const sp of spList) {
+      if (spMap[sp].length > maxRounds) {
+        maxRounds = spMap[sp].length;
+      }
+    }
+
+    console.log(`[app-cart] Starting SMS send for ${spList.length} salespersons across max ${maxRounds} rounds`);
+
+    for (let round = 0; round < maxRounds; round++) {
+      const sendPromises = [];
+
+      for (const sp of spList) {
+        if (round < spMap[sp].length) {
+          const custPhone = spMap[sp][round];
+          const task = firestore
+            .collection('users')
+            .doc(sp)
+            .collection('sendmsg')
+            .doc('send')
+            .set({
+              SmsBody: smsBody,
+              SmsTo: custPhone,
+              send: 'yes',
+            })
+            .then(() => {
+              console.log(`[app-cart-sms] Sent to Firestore from SP ${sp} to Cust ${custPhone} (round ${round})`);
+            })
+            .catch((err) => {
+              console.error(`[app-cart-sms] Failed SP ${sp} to Cust ${custPhone}:`, err.message);
+            });
+
+          sendPromises.push(task);
+        }
+      }
+
+      await Promise.all(sendPromises);
+
+      // If another round follows, wait 1 sec so device has time before receiving next SMS request
+      if (round < maxRounds - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    console.log('[app-cart] Completed background notifications & SMS');
+  } catch (err) {
+    console.error('[app-cart] Fatal error in background processing:', err);
+  }
+}
+
+app.post(['/app-cart', '/app-cart-notification'], (req, res) => {
+  try {
+    const body = req.body || {};
+    const items = Array.isArray(body)
+      ? body
+      : (Array.isArray(body.items) ? body.items : (Array.isArray(body.carts) ? body.carts : []));
+
+    // Immediate response
+    res.status(200).json({
+      success: true,
+      message: 'Processing in background',
+      count: items.length,
+    });
+
+    if (items.length > 0) {
+      runInBackground(processAppCartNotificationsBackground(items, body));
+    }
+  } catch (err) {
+    console.error('[app-cart] Request error:', err.message);
+    return res.status(200).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('Server is running on http://localhost:' + PORT);
