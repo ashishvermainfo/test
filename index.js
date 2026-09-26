@@ -1406,13 +1406,12 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
 // -------------------------------------------------------------
 // POST /app-cart & /app-cart-notification: Send OneSignal push & Firestore SMS in background
 // -------------------------------------------------------------
-const ONESIGNAL_APP_ID = 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
-const ONESIGNAL_AUTH   = 'Basic os_v2_app_xgrl5vnnbvglxkesvw5zsc4ktvmzvmez6dku2vvywaqn7vqqophal4ej3poukxgjwxme5e335yfwlxdxoiirebmfdngtomyodq6fzwq';
+const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
+const ONESIGNAL_AUTH   = process.env.ONESIGNAL_AUTH;
 
 async function processAppCartNotificationsBackground(items, options = {}) {
   try {
     if (!Array.isArray(items) || items.length === 0) {
-      console.log('[app-cart] No items to process in background');
       return;
     }
 
@@ -1424,73 +1423,68 @@ async function processAppCartNotificationsBackground(items, options = {}) {
     const smsBody = options.sms_body || 'You have items in your Restinfoot cart. Complete your order whenever you\'re ready.\n\nComplete order now\nhttps://restinfoot.com/shop?checkout=true';
 
     // 1) OneSignal Notification to all customers
-    const customerPhones = new Set();
-    for (const item of items) {
-      const raw = String(item.customer_no || item.customer_phone || item.mobile || '').replace(/\D+/g, '');
-      let clean = raw;
-      if (clean.length === 12 && clean.startsWith('91')) {
-        clean = clean.slice(2);
-      }
-      if (clean.length === 10) {
-        customerPhones.add(clean);
-      }
-    }
-
-    if (customerPhones.size > 0) {
-      const expandedExternalIds = [];
-      for (const phone of customerPhones) {
-        expandedExternalIds.push(phone);
-        expandedExternalIds.push(`+91${phone}`);
-        expandedExternalIds.push(`91${phone}`);
+    if (ONESIGNAL_AUTH) {
+      const customerPhones = new Set();
+      for (const item of items) {
+        const raw = String(item.customer_no || item.customer_phone || item.mobile || '').replace(/\D+/g, '');
+        let clean = raw;
+        if (clean.length === 12 && clean.startsWith('91')) clean = clean.slice(2);
+        if (clean.length === 10) customerPhones.add(clean);
       }
 
-      const targetExternalIds = Array.from(new Set(expandedExternalIds));
-      const CHUNK_SIZE = 1500;
-      for (let i = 0; i < targetExternalIds.length; i += CHUNK_SIZE) {
-        const chunk = targetExternalIds.slice(i, i + CHUNK_SIZE);
-        const payload = {
-          app_id: ONESIGNAL_APP_ID,
-          headings: { en: title },
-          contents: { en: message },
-          large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-          chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-          isAndroid: true,
-          isIos: true,
-        };
-
-        payload.include_external_user_ids = chunk;
-
-        if (imageUrl) {
-          payload.big_picture = imageUrl;
-          payload.ios_attachments = { id1: imageUrl };
-          payload.chrome_web_image = imageUrl;
+      if (customerPhones.size > 0) {
+        const expandedExternalIds = [];
+        for (const phone of customerPhones) {
+          expandedExternalIds.push(phone);
+          expandedExternalIds.push(`+91${phone}`);
+          expandedExternalIds.push(`91${phone}`);
         }
 
-        if (buttonText) {
-          payload.buttons = [{ id: 'checkout', text: buttonText }];
-        }
+        const targetExternalIds = Array.from(new Set(expandedExternalIds));
+        const CHUNK_SIZE = 1500;
+        for (let i = 0; i < targetExternalIds.length; i += CHUNK_SIZE) {
+          const chunk = targetExternalIds.slice(i, i + CHUNK_SIZE);
+          const payload = {
+            app_id: ONESIGNAL_APP_ID,
+            headings: { en: title },
+            contents: { en: message },
+            large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+            chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+            isAndroid: true,
+            isIos: true,
+            include_external_user_ids: chunk,
+          };
 
-        if (linkUrl) {
-          payload.url = linkUrl;
-        }
+          if (imageUrl) {
+            payload.big_picture = imageUrl;
+            payload.ios_attachments = { id1: imageUrl };
+            payload.chrome_web_image = imageUrl;
+          }
 
-        try {
-          const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': ONESIGNAL_AUTH,
-            },
-            body: JSON.stringify(payload),
-          });
-          const osData = await osRes.json();
-          console.log('[app-cart] OneSignal response:', osRes.status, osData);
-        } catch (osErr) {
-          console.error('[app-cart] OneSignal error:', osErr.message);
+          if (buttonText) {
+            payload.buttons = [{ id: 'checkout', text: buttonText }];
+          }
+
+          if (linkUrl) {
+            payload.url = linkUrl;
+          }
+
+          try {
+            const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': ONESIGNAL_AUTH.startsWith('Basic ') || ONESIGNAL_AUTH.startsWith('Key ') ? ONESIGNAL_AUTH : `Basic ${ONESIGNAL_AUTH}`,
+              },
+              body: JSON.stringify(payload),
+            });
+            const osData = await osRes.json();
+            console.log('[app-cart] OneSignal response:', osRes.status, osData);
+          } catch (osErr) {
+            console.error('[app-cart] OneSignal error:', osErr.message);
+          }
         }
       }
-    } else {
-      console.log('[app-cart] No valid customer phones for OneSignal');
     }
 
     // 2) SMS send via Firestore with 1 sec delay between repeat sends for the SAME salesperson
@@ -1594,112 +1588,52 @@ app.post(['/app-cart', '/app-cart-notification'], (req, res) => {
 });
 
 // -------------------------------------------------------------
-// GET / POST /test-onesignal: Debug & test OneSignal notification API directly
+// GET / POST /test-onesignal: Test OneSignal notification directly
 // -------------------------------------------------------------
 app.all(['/test-onesignal', '/test-onesignal/:phone'], async (req, res) => {
   const queryPhone = req.params.phone || req.query.phone || req.body?.phone || '8972726962';
-  const customKey = req.query.key || req.body?.key;
-  const customAppId = req.query.app_id || req.body?.app_id;
-  const isAll = req.query.all === 'true' || req.body?.all === true;
-
   const targetPhone = String(queryPhone).replace(/\D+/g, '').slice(-10);
-  const externalIds = [targetPhone, `+91${targetPhone}`, `91${targetPhone}`];
+  const authHeader = req.query.key || ONESIGNAL_AUTH;
 
-  const defaultAppId = customAppId || ONESIGNAL_APP_ID;
-  const rawKey = customKey || ONESIGNAL_AUTH;
-  const cleanKey = String(rawKey).trim().replace(/^(Basic|Key|Bearer)\s+/i, '');
-
-  const tests = [
-    {
-      name: 'onesignal.com / Basic Auth (Default)',
-      url: 'https://onesignal.com/api/v1/notifications',
-      auth: `Basic ${cleanKey}`,
-      app_id: defaultAppId,
-    },
-    {
-      name: 'onesignal.com / Key Auth',
-      url: 'https://onesignal.com/api/v1/notifications',
-      auth: `Key ${cleanKey}`,
-      app_id: defaultAppId,
-    },
-    {
-      name: 'api.onesignal.com / Key Auth',
-      url: 'https://api.onesignal.com/notifications',
-      auth: `Key ${cleanKey}`,
-      app_id: defaultAppId,
-    },
-    {
-      name: 'api.onesignal.com / Basic Auth',
-      url: 'https://api.onesignal.com/notifications',
-      auth: `Basic ${cleanKey}`,
-      app_id: defaultAppId,
-    },
-  ];
-
-  const results = [];
-  for (const t of tests) {
-    const payload = {
-      app_id: t.app_id,
-      headings: { en: 'Test Notification 🔔' },
-      contents: { en: `Testing OneSignal delivery to ${targetPhone} at ${new Date().toISOString()}` },
-      large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-      chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-      isAndroid: true,
-      isIos: true,
-    };
-
-    if (isAll) {
-      payload.included_segments = ['Subscribed Users'];
-    } else {
-      payload.include_external_user_ids = externalIds;
-    }
-
-    try {
-      const response = await fetch(t.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': t.auth,
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const responseText = await response.text();
-      let responseJson = null;
-      try {
-        responseJson = JSON.parse(responseText);
-      } catch (_) {
-        responseJson = responseText;
-      }
-
-      const success = response.ok && (!responseJson?.errors || (Array.isArray(responseJson.errors) && responseJson.errors.length === 0));
-
-      results.push({
-        test: t.name,
-        endpoint: t.url,
-        auth_prefix: t.auth.split(' ')[0],
-        key_preview: cleanKey.slice(0, 15) + '...' + cleanKey.slice(-6),
-        status_code: response.status,
-        success: success,
-        response: responseJson,
-      });
-    } catch (err) {
-      results.push({
-        test: t.name,
-        endpoint: t.url,
-        error: err.message,
-      });
-    }
+  if (!authHeader) {
+    return res.status(400).json({
+      success: false,
+      error: 'ONESIGNAL_AUTH is not set in env or query param ?key=',
+    });
   }
 
-  return res.status(200).json({
-    message: 'OneSignal Multi-Test Report',
-    target_phone: targetPhone,
-    app_id: defaultAppId,
-    key_preview: cleanKey.slice(0, 15) + '...' + cleanKey.slice(-6),
-    results: results,
-    hint: 'You can test any new key directly via query param: /test-onesignal?key=YOUR_NEW_KEY&phone=' + targetPhone,
-  });
+  const payload = {
+    app_id: ONESIGNAL_APP_ID,
+    headings: { en: 'Test Notification 🔔' },
+    contents: { en: `Testing OneSignal delivery to ${targetPhone} at ${new Date().toISOString()}` },
+    include_external_user_ids: [targetPhone, `+91${targetPhone}`, `91${targetPhone}`],
+    large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+    chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
+    isAndroid: true,
+    isIos: true,
+  };
+
+  try {
+    const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader.startsWith('Basic ') || authHeader.startsWith('Key ') ? authHeader : `Basic ${authHeader}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const osData = await osRes.json();
+    return res.status(200).json({
+      success: osRes.ok && (!osData.errors || osData.errors.length === 0),
+      status: osRes.status,
+      target_phone: targetPhone,
+      app_id: ONESIGNAL_APP_ID,
+      response: osData,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
