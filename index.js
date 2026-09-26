@@ -1407,7 +1407,7 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
 // POST /app-cart & /app-cart-notification: Send OneSignal push & Firestore SMS in background
 // -------------------------------------------------------------
 const ONESIGNAL_APP_ID = 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
-const ONESIGNAL_AUTH = 'Basic os_v2_app_xgrl5vnnbvglxkesvw5zsc4ktvmzvmez6dku2vvywaqn7vqqophal4ej3poukxgjwxme5e335yfwlxdxoiirebmfdngtomyodq6fzwq';
+const ONESIGNAL_AUTH   = 'Basic os_v2_app_xgrl5vnnbvglxkesvw5zsc4ktvmzvmez6dku2vvywaqn7vqqophal4ej3poukxgjwxme5e335yfwlxdxoiirebmfdngtomyodq6fzwq';
 
 async function processAppCartNotificationsBackground(items, options = {}) {
   try {
@@ -1444,20 +1444,21 @@ async function processAppCartNotificationsBackground(items, options = {}) {
         expandedExternalIds.push(`91${phone}`);
       }
 
+      const targetExternalIds = Array.from(new Set(expandedExternalIds));
       const CHUNK_SIZE = 1500;
-      for (let i = 0; i < expandedExternalIds.length; i += CHUNK_SIZE) {
-        const chunk = expandedExternalIds.slice(i, i + CHUNK_SIZE);
+      for (let i = 0; i < targetExternalIds.length; i += CHUNK_SIZE) {
+        const chunk = targetExternalIds.slice(i, i + CHUNK_SIZE);
         const payload = {
           app_id: ONESIGNAL_APP_ID,
-          include_external_user_ids: chunk,
           headings: { en: title },
           contents: { en: message },
           large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
           chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-          url: linkUrl,
           isAndroid: true,
           isIos: true,
         };
+
+        payload.include_external_user_ids = chunk;
 
         if (imageUrl) {
           payload.big_picture = imageUrl;
@@ -1469,12 +1470,16 @@ async function processAppCartNotificationsBackground(items, options = {}) {
           payload.buttons = [{ id: 'checkout', text: buttonText }];
         }
 
+        if (linkUrl) {
+          payload.url = linkUrl;
+        }
+
         try {
           const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: ONESIGNAL_AUTH,
+              'Authorization': ONESIGNAL_AUTH,
             },
             body: JSON.stringify(payload),
           });
