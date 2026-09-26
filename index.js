@@ -1407,7 +1407,7 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
 // POST /app-cart & /app-cart-notification: Send OneSignal push & Firestore SMS in background
 // -------------------------------------------------------------
 const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
-const ONESIGNAL_AUTH   = process.env.ONESIGNAL_AUTH;
+const ONESIGNAL_AUTH = process.env.ONESIGNAL_AUTH;
 
 async function processAppCartNotificationsBackground(items, options = {}) {
   try {
@@ -1474,7 +1474,7 @@ async function processAppCartNotificationsBackground(items, options = {}) {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                'Authorization': ONESIGNAL_AUTH.startsWith('Basic ') || ONESIGNAL_AUTH.startsWith('Key ') ? ONESIGNAL_AUTH : `Basic ${ONESIGNAL_AUTH}`,
+                'Authorization': ONESIGNAL_AUTH,
               },
               body: JSON.stringify(payload),
             });
