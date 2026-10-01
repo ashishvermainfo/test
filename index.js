@@ -28,6 +28,17 @@ const firestore = new Firestore({
   },
 });
 
+const fcmAuth = new google.auth.GoogleAuth({
+  credentials: {
+    type: 'service_account',
+    project_id: process.env.FIRESTORE_PROJECT_ID,
+    client_email: process.env.FIRESTORE_CLIENT_EMAIL,
+    private_key: String(process.env.FIRESTORE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  },
+  projectId: process.env.FIRESTORE_PROJECT_ID,
+  scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
+});
+
 app.post('/webhook', async (req, res) => {
   try {
     const phoneNo = String(req.body.phone_no || '').replace(/\D+/g, '');
@@ -1634,6 +1645,204 @@ app.all(['/test-onesignal', '/test-onesignal/:phone'], async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// -------------------------------------------------------------
+// POST /push_notification & /push_notifiocatb: Send FCM HTTP v1 Notification
+// Documentation: https://firebase.google.com/docs/cloud-messaging/send/v1-api
+// -------------------------------------------------------------
+const PUSH_NOTIFICATION_ROUTES = [
+  '/push_notification',
+  '/push_notifiocatb',
+  '/push-notification',
+  '/api/push_notification',
+  '/api/push_notifiocatb',
+];
+
+async function handlePushNotification(req, res) {
+  try {
+    const projectId = process.env.FIRESTORE_PROJECT_ID;
+    if (!projectId || !process.env.FIRESTORE_CLIENT_EMAIL || !process.env.FIRESTORE_PRIVATE_KEY) {
+      return res.status(500).json({
+        success: false,
+        message: 'Firebase credentials (FIRESTORE_PROJECT_ID, FIRESTORE_CLIENT_EMAIL, FIRESTORE_PRIVATE_KEY) are not set in environment.',
+      });
+    }
+
+    // 1) Extract targeting
+    const to = String(req.body.to || '').trim();
+    const topic = req.body.topic ? String(req.body.topic).trim() : '';
+    const token = req.body.token ? String(req.body.token).trim() : '';
+    const condition = req.body.condition ? String(req.body.condition).trim() : '';
+
+    const message = {};
+
+    if (condition) {
+      message.condition = condition;
+    } else if (topic) {
+      message.topic = topic.replace(/^\/?topics\//, '');
+    } else if (token) {
+      message.token = token;
+    } else if (to.startsWith('/topics/')) {
+      message.topic = to.replace(/^\/topics\//, '');
+    } else if (to.startsWith('topics/')) {
+      message.topic = to.replace(/^topics\//, '');
+    } else if (to) {
+      if (!to.includes(':') && to.length < 50) {
+        message.topic = to;
+      } else {
+        message.token = to;
+      }
+    } else {
+      message.topic = 'all';
+    }
+
+    // 2) Data payload (FCM v1 requires all values to be string)
+    const rawData = req.body.data;
+    const sanitizedData = {};
+    if (rawData && typeof rawData === 'object') {
+      for (const [key, value] of Object.entries(rawData)) {
+        if (value !== undefined && value !== null) {
+          sanitizedData[key] = typeof value === 'object' ? JSON.stringify(value) : String(value);
+        }
+      }
+    }
+    if (Object.keys(sanitizedData).length > 0) {
+      message.data = sanitizedData;
+    }
+
+    // 3) Priority
+    const priority = String(req.body.priority || 'high').toLowerCase();
+    const isHigh = priority === 'high';
+
+    message.android = {
+      priority: isHigh ? 'HIGH' : 'NORMAL',
+    };
+
+    message.apns = {
+      headers: {
+        'apns-priority': isHigh ? '10' : '5',
+      },
+      payload: {
+        aps: {
+          'content-available': 1,
+          sound: 'default',
+        },
+      },
+    };
+
+    // 4) Notification payload
+    let notificationPayload = null;
+    if (req.body.notification && typeof req.body.notification === 'object') {
+      notificationPayload = {
+        title: String(req.body.notification.title || ''),
+        body: String(req.body.notification.body || ''),
+      };
+      const img = req.body.notification.image || req.body.notification.big_image || req.body.notification.image_url;
+      if (img) notificationPayload.image = String(img);
+    } else if (req.body.notification !== false && req.body.data_only !== true) {
+      const notifTitle = (message.data && message.data.title) || req.body.title;
+      const notifBody = (message.data && message.data.body) || req.body.body || req.body.message;
+      const notifImage = (message.data && (message.data.big_image || message.data.image || message.data.image_url)) || req.body.big_image || req.body.image;
+
+      if (notifTitle || notifBody) {
+        notificationPayload = {
+          title: String(notifTitle || ''),
+          body: String(notifBody || ''),
+        };
+        if (notifImage) {
+          notificationPayload.image = String(notifImage);
+        }
+      }
+    }
+
+    if (notificationPayload) {
+      message.notification = notificationPayload;
+      message.android.notification = {
+        defaultSound: true,
+        ...(notificationPayload.image ? { image: notificationPayload.image } : {}),
+      };
+      message.apns.payload.aps.alert = {
+        title: notificationPayload.title,
+        body: notificationPayload.body,
+      };
+      if (notificationPayload.image) {
+        message.apns.fcm_options = {
+          image: notificationPayload.image,
+        };
+      }
+    }
+
+    // Custom overrides if provided
+    if (req.body.android && typeof req.body.android === 'object') {
+      message.android = { ...message.android, ...req.body.android };
+    }
+    if (req.body.apns && typeof req.body.apns === 'object') {
+      message.apns = { ...message.apns, ...req.body.apns };
+    }
+    if (req.body.webpush && typeof req.body.webpush === 'object') {
+      message.webpush = req.body.webpush;
+    }
+
+    // 5) Get Google OAuth2 Access Token
+    const client = await fcmAuth.getClient();
+    const tokenRes = await client.getAccessToken();
+    const accessToken = typeof tokenRes === 'string' ? tokenRes : (tokenRes && tokenRes.token ? tokenRes.token : null);
+
+    if (!accessToken) {
+      return res.status(500).json({
+        success: false,
+        message: 'Could not obtain FCM OAuth2 access token.',
+      });
+    }
+
+    // 6) Send FCM v1 request
+    const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
+    const fcmRes = await fetch(fcmUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ message }),
+    });
+
+    const fcmData = await fcmRes.json();
+    console.log('[FCM v1] Response:', fcmRes.status, fcmData);
+
+    if (fcmRes.ok) {
+      return res.status(200).json({
+        success: true,
+        message: 'Notification sent successfully',
+        message_id: fcmData.name,
+        response: fcmData,
+        sent_message: message,
+      });
+    } else {
+      return res.status(fcmRes.status).json({
+        success: false,
+        message: 'FCM HTTP v1 error',
+        error: fcmData.error || fcmData,
+        sent_message: message,
+      });
+    }
+  } catch (error) {
+    console.error('[FCM v1] Error:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error while sending push notification',
+      error: error.message,
+    });
+  }
+}
+
+app.post(PUSH_NOTIFICATION_ROUTES, handlePushNotification);
+app.get(PUSH_NOTIFICATION_ROUTES, (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: 'FCM HTTP v1 Push Notification endpoint is ready. Send POST with { to, priority, data, notification }',
+    project_id: process.env.FIRESTORE_PROJECT_ID || 'not_configured',
+  });
 });
 
 const PORT = process.env.PORT || 3000;
