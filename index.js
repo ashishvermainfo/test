@@ -1657,6 +1657,8 @@ const PUSH_NOTIFICATION_ROUTES = [
   '/push-notification',
   '/api/push_notification',
   '/api/push_notifiocatb',
+  '/send-push-notification',
+  '/api/send-push-notification',
 ];
 
 async function handlePushNotification(req, res) {
@@ -1669,122 +1671,14 @@ async function handlePushNotification(req, res) {
       });
     }
 
-    // 1) Extract targeting
-    const to = String(req.body.to || '').trim();
-    const topic = req.body.topic ? String(req.body.topic).trim() : '';
-    const token = req.body.token ? String(req.body.token).trim() : '';
-    const condition = req.body.condition ? String(req.body.condition).trim() : '';
-
-    const message = {};
-
-    if (condition) {
-      message.condition = condition;
-    } else if (topic) {
-      message.topic = topic.replace(/^\/?topics\//, '');
-    } else if (token) {
-      message.token = token;
-    } else if (to.startsWith('/topics/')) {
-      message.topic = to.replace(/^\/topics\//, '');
-    } else if (to.startsWith('topics/')) {
-      message.topic = to.replace(/^topics\//, '');
-    } else if (to) {
-      if (!to.includes(':') && to.length < 50) {
-        message.topic = to;
-      } else {
-        message.token = to;
-      }
-    } else {
-      message.topic = 'all';
+    if (!req.body || typeof req.body !== 'object' || Object.keys(req.body).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Request body cannot be empty.',
+      });
     }
 
-    // 2) Data payload (FCM v1 requires all values to be string)
-    const rawData = req.body.data;
-    const sanitizedData = {};
-    if (rawData && typeof rawData === 'object') {
-      for (const [key, value] of Object.entries(rawData)) {
-        if (value !== undefined && value !== null) {
-          sanitizedData[key] = typeof value === 'object' ? JSON.stringify(value) : String(value);
-        }
-      }
-    }
-    if (Object.keys(sanitizedData).length > 0) {
-      message.data = sanitizedData;
-    }
-
-    // 3) Priority
-    const priority = String(req.body.priority || 'high').toLowerCase();
-    const isHigh = priority === 'high';
-
-    message.android = {
-      priority: isHigh ? 'HIGH' : 'NORMAL',
-    };
-
-    message.apns = {
-      headers: {
-        'apns-priority': isHigh ? '10' : '5',
-      },
-      payload: {
-        aps: {
-          'content-available': 1,
-          sound: 'default',
-        },
-      },
-    };
-
-    // 4) Notification payload
-    let notificationPayload = null;
-    if (req.body.notification && typeof req.body.notification === 'object') {
-      notificationPayload = {
-        title: String(req.body.notification.title || ''),
-        body: String(req.body.notification.body || ''),
-      };
-      const img = req.body.notification.image || req.body.notification.big_image || req.body.notification.image_url;
-      if (img) notificationPayload.image = String(img);
-    } else if (req.body.notification !== false && req.body.data_only !== true) {
-      const notifTitle = (message.data && message.data.title) || req.body.title;
-      const notifBody = (message.data && message.data.body) || req.body.body || req.body.message;
-      const notifImage = (message.data && (message.data.big_image || message.data.image || message.data.image_url)) || req.body.big_image || req.body.image;
-
-      if (notifTitle || notifBody) {
-        notificationPayload = {
-          title: String(notifTitle || ''),
-          body: String(notifBody || ''),
-        };
-        if (notifImage) {
-          notificationPayload.image = String(notifImage);
-        }
-      }
-    }
-
-    if (notificationPayload) {
-      message.notification = notificationPayload;
-      message.android.notification = {
-        defaultSound: true,
-        ...(notificationPayload.image ? { image: notificationPayload.image } : {}),
-      };
-      message.apns.payload.aps.alert = {
-        title: notificationPayload.title,
-        body: notificationPayload.body,
-      };
-      if (notificationPayload.image) {
-        message.apns.fcm_options = {
-          image: notificationPayload.image,
-        };
-      }
-    }
-
-    // Custom overrides if provided
-    if (req.body.android && typeof req.body.android === 'object') {
-      message.android = { ...message.android, ...req.body.android };
-    }
-    if (req.body.apns && typeof req.body.apns === 'object') {
-      message.apns = { ...message.apns, ...req.body.apns };
-    }
-    if (req.body.webpush && typeof req.body.webpush === 'object') {
-      message.webpush = req.body.webpush;
-    }
-
-    // 5) Get Google OAuth2 Access Token
+    // 1) Get Google OAuth2 Access Token
     const client = await fcmAuth.getClient();
     const tokenRes = await client.getAccessToken();
     const accessToken = typeof tokenRes === 'string' ? tokenRes : (tokenRes && tokenRes.token ? tokenRes.token : null);
@@ -1796,7 +1690,10 @@ async function handlePushNotification(req, res) {
       });
     }
 
-    // 6) Send FCM v1 request
+    // 2) Payload directly as posted (wrapped in message if not already wrapped)
+    const payload = req.body.message ? req.body : { message: req.body };
+
+    // 3) Send payload to FCM HTTP v1
     const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
     const fcmRes = await fetch(fcmUrl, {
       method: 'POST',
@@ -1804,7 +1701,7 @@ async function handlePushNotification(req, res) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify(payload),
     });
 
     const fcmData = await fcmRes.json();
@@ -1816,14 +1713,14 @@ async function handlePushNotification(req, res) {
         message: 'Notification sent successfully',
         message_id: fcmData.name,
         response: fcmData,
-        sent_message: message,
+        sent_payload: payload,
       });
     } else {
       return res.status(fcmRes.status).json({
         success: false,
         message: 'FCM HTTP v1 error',
         error: fcmData.error || fcmData,
-        sent_message: message,
+        sent_payload: payload,
       });
     }
   } catch (error) {
@@ -1840,7 +1737,7 @@ app.post(PUSH_NOTIFICATION_ROUTES, handlePushNotification);
 app.get(PUSH_NOTIFICATION_ROUTES, (req, res) => {
   return res.status(200).json({
     success: true,
-    message: 'FCM HTTP v1 Push Notification endpoint is ready. Send POST with { to, priority, data, notification }',
+    message: 'FCM HTTP v1 Push Notification endpoint is ready. Send POST with FCM payload.',
     project_id: process.env.FIRESTORE_PROJECT_ID || 'not_configured',
   });
 });
