@@ -1415,87 +1415,138 @@ app.get(['/flushjoblead', '/flushjobleads', '/flushjoblead/:count', '/flushjoble
 });
 
 // -------------------------------------------------------------
-// POST /app-cart & /app-cart-notification: Send OneSignal push & Firestore SMS in background
+// sendFcmNotification (fcm_notification): Send FCM HTTP v1 Notification
+// - If topic === 'all': sends 1 FCM request directly.
+// - If topic is array of numbers or comma-separated string: sends batch with topic: user_phone.
 // -------------------------------------------------------------
-const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || 'b9a2bed5-ad0d-4cbb-a892-adbb990b8a9d';
-const ONESIGNAL_AUTH = process.env.ONESIGNAL_AUTH;
+async function sendFcmNotification(payload = {}) {
+  const projectId = process.env.FIRESTORE_PROJECT_ID;
+  if (!projectId || !process.env.FIRESTORE_CLIENT_EMAIL || !process.env.FIRESTORE_PRIVATE_KEY) {
+    throw new Error('Firebase credentials (FIRESTORE_PROJECT_ID, FIRESTORE_CLIENT_EMAIL, FIRESTORE_PRIVATE_KEY) are not set in environment.');
+  }
 
+  // 1) Get Google OAuth2 Access Token
+  const client = await fcmAuth.getClient();
+  const tokenRes = await client.getAccessToken();
+  const accessToken = typeof tokenRes === 'string' ? tokenRes : (tokenRes && tokenRes.token ? tokenRes.token : null);
+
+  if (!accessToken) {
+    throw new Error('Could not obtain FCM OAuth2 access token.');
+  }
+
+  // 2) Extract base message object (as sent by caller)
+  const baseMessage = payload.message ? { ...payload.message } : { ...payload };
+
+  // 3) Inspect topic
+  const rawTopic = baseMessage.topic || payload.topic;
+
+  let phoneList = [];
+  if (Array.isArray(rawTopic)) {
+    phoneList = rawTopic;
+  } else if (typeof rawTopic === 'string' && rawTopic.includes(',')) {
+    phoneList = rawTopic.split(',');
+  } else if (Array.isArray(payload.items) && rawTopic !== 'all') {
+    phoneList = payload.items.map((it) => it.customer_no || it.customer_phone || it.mobile || it.phone || '');
+  }
+
+  // Clean 10-digit phone numbers
+  const targetPhones = new Set();
+  for (const p of phoneList) {
+    const clean = String(p || '').replace(/\D+/g, '').slice(-10);
+    if (clean.length === 10) {
+      targetPhones.add(clean);
+    }
+  }
+
+  const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
+
+  // Case A: topic is array or comma-separated list of phone numbers -> send batch
+  if (targetPhones.size > 0) {
+    const phones = Array.from(targetPhones);
+    console.log(`[FCM v1] Sending batch to ${phones.length} phone topics in background...`);
+
+    const results = [];
+    const BATCH_SIZE = 15;
+    for (let i = 0; i < phones.length; i += BATCH_SIZE) {
+      const chunk = phones.slice(i, i + BATCH_SIZE);
+      const promises = chunk.map(async (phone) => {
+        const message = { ...baseMessage, topic: phone };
+        try {
+          const res = await fetch(fcmUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({ message }),
+          });
+          const data = await res.json();
+          return { phone, ok: res.ok, status: res.status, data };
+        } catch (err) {
+          return { phone, ok: false, error: err.message };
+        }
+      });
+
+      const chunkResults = await Promise.all(promises);
+      results.push(...batchResults);
+    }
+
+    const successCount = results.filter((r) => r.ok).length;
+    console.log(`[FCM v1] Sent ${successCount}/${phones.length} notifications`);
+    return {
+      success: successCount > 0,
+      sent_count: successCount,
+      failed_count: phones.length - successCount,
+      total: phones.length,
+      results,
+    };
+  }
+
+  // Case B: topic is single string (e.g. 'all' or specific topic) -> send single FCM
+  const topic = (typeof rawTopic === 'string' && rawTopic.trim()) ? rawTopic.trim() : 'all';
+  const message = { ...baseMessage, topic };
+  console.log(`[FCM v1] Sending single notification to topic: ${topic}`);
+
+  const fcmRes = await fetch(fcmUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ message }),
+  });
+
+  const fcmData = await fcmRes.json();
+  console.log('[FCM v1] Single response:', fcmRes.status, fcmData);
+
+  return {
+    success: fcmRes.ok,
+    status: fcmRes.status,
+    topic,
+    message_id: fcmData.name,
+    response: fcmData,
+    sent_payload: { message },
+  };
+}
+
+const fcm_notification = sendFcmNotification;
+
+// -------------------------------------------------------------
+// POST /app-cart & /app-cart-notification: Send FCM push & Firestore SMS in background
+// -------------------------------------------------------------
 async function processAppCartNotificationsBackground(items, options = {}) {
   try {
     if (!Array.isArray(items) || items.length === 0) {
       return;
     }
 
-    const title = options.title || 'Your Cart Is Waiting! 🛒';
-    const message = options.message || 'Your selected items are still in your cart. Complete your order before they\'re gone!';
-    const imageUrl = options.image_url || 'https://restinfoot.com/wp-content/uploads/2026/09/app-cart-banner.webp';
-    const buttonText = options.button_text || 'Complete Order';
-    const linkUrl = options.url || 'https://restinfoot.com/shop?checkout=true';
     const smsBody = options.sms_body || 'You have items in your Restinfoot cart. Complete your order whenever you\'re ready.\n\nComplete order now\nhttps://restinfoot.com/shop?checkout=true';
 
-    // 1) OneSignal Notification to all customers
-    if (ONESIGNAL_AUTH) {
-      const customerPhones = new Set();
-      for (const item of items) {
-        const raw = String(item.customer_no || item.customer_phone || item.mobile || '').replace(/\D+/g, '');
-        let clean = raw;
-        if (clean.length === 12 && clean.startsWith('91')) clean = clean.slice(2);
-        if (clean.length === 10) customerPhones.add(clean);
-      }
-
-      if (customerPhones.size > 0) {
-        const expandedExternalIds = [];
-        for (const phone of customerPhones) {
-          expandedExternalIds.push(phone);
-          expandedExternalIds.push(`+91${phone}`);
-          expandedExternalIds.push(`91${phone}`);
-        }
-
-        const targetExternalIds = Array.from(new Set(expandedExternalIds));
-        const CHUNK_SIZE = 1500;
-        for (let i = 0; i < targetExternalIds.length; i += CHUNK_SIZE) {
-          const chunk = targetExternalIds.slice(i, i + CHUNK_SIZE);
-          const payload = {
-            app_id: ONESIGNAL_APP_ID,
-            headings: { en: title },
-            contents: { en: message },
-            large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-            chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-            isAndroid: true,
-            isIos: true,
-            include_external_user_ids: chunk,
-          };
-
-          if (imageUrl) {
-            payload.big_picture = imageUrl;
-            payload.ios_attachments = { id1: imageUrl };
-            payload.chrome_web_image = imageUrl;
-          }
-
-          if (buttonText) {
-            payload.buttons = [{ id: 'checkout', text: buttonText }];
-          }
-
-          if (linkUrl) {
-            payload.url = linkUrl;
-          }
-
-          try {
-            const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': ONESIGNAL_AUTH,
-              },
-              body: JSON.stringify(payload),
-            });
-            const osData = await osRes.json();
-            console.log('[app-cart] OneSignal response:', osRes.status, osData);
-          } catch (osErr) {
-            console.error('[app-cart] OneSignal error:', osErr.message);
-          }
-        }
-      }
+    // 1) FCM Push Notification (send payload directly as sent)
+    try {
+      await sendFcmNotification(options);
+    } catch (fcmErr) {
+      console.error('[app-cart] FCM notification error:', fcmErr.message);
     }
 
     // 2) SMS send via Firestore with 1 sec delay between repeat sends for the SAME salesperson
@@ -1599,78 +1650,16 @@ app.post(['/app-cart', '/app-cart-notification'], (req, res) => {
 });
 
 // -------------------------------------------------------------
-// GET / POST /test-onesignal: Test OneSignal notification directly
-// -------------------------------------------------------------
-app.all(['/test-onesignal', '/test-onesignal/:phone'], async (req, res) => {
-  const queryPhone = req.params.phone || req.query.phone || req.body?.phone || '8972726962';
-  const targetPhone = String(queryPhone).replace(/\D+/g, '').slice(-10);
-  const authHeader = req.query.key || ONESIGNAL_AUTH;
-
-  if (!authHeader) {
-    return res.status(400).json({
-      success: false,
-      error: 'ONESIGNAL_AUTH is not set in env or query param ?key=',
-    });
-  }
-
-  const payload = {
-    app_id: ONESIGNAL_APP_ID,
-    headings: { en: 'Test Notification 🔔' },
-    contents: { en: `Testing OneSignal delivery to ${targetPhone} at ${new Date().toISOString()}` },
-    include_external_user_ids: [targetPhone, `+91${targetPhone}`, `91${targetPhone}`],
-    large_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-    chrome_web_icon: 'https://img.os-content.com/t/16c935c9-54da-4f40-9a48-d899768570a6/Hs74pRLKRmqjC2Du7lMK_IMG-20240904-WA00082.jpg',
-    isAndroid: true,
-    isIos: true,
-  };
-
-  try {
-    const osRes = await fetch('https://onesignal.com/api/v1/notifications', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': authHeader.startsWith('Basic ') || authHeader.startsWith('Key ') ? authHeader : `Basic ${authHeader}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const osData = await osRes.json();
-    return res.status(200).json({
-      success: osRes.ok && (!osData.errors || osData.errors.length === 0),
-      status: osRes.status,
-      target_phone: targetPhone,
-      app_id: ONESIGNAL_APP_ID,
-      response: osData,
-    });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// -------------------------------------------------------------
-// POST /push_notification & /push_notifiocatb: Send FCM HTTP v1 Notification
+// POST /push_notification & /fcm_notification: Send FCM HTTP v1 Notification
 // Documentation: https://firebase.google.com/docs/cloud-messaging/send/v1-api
 // -------------------------------------------------------------
 const PUSH_NOTIFICATION_ROUTES = [
   '/push_notification',
-  '/push_notifiocatb',
-  '/push-notification',
-  '/api/push_notification',
-  '/api/push_notifiocatb',
-  '/send-push-notification',
-  '/api/send-push-notification',
+  '/fcm_notification',
 ];
 
 async function handlePushNotification(req, res) {
   try {
-    const projectId = process.env.FIRESTORE_PROJECT_ID;
-    if (!projectId || !process.env.FIRESTORE_CLIENT_EMAIL || !process.env.FIRESTORE_PRIVATE_KEY) {
-      return res.status(500).json({
-        success: false,
-        message: 'Firebase credentials (FIRESTORE_PROJECT_ID, FIRESTORE_CLIENT_EMAIL, FIRESTORE_PRIVATE_KEY) are not set in environment.',
-      });
-    }
-
     if (!req.body || typeof req.body !== 'object' || Object.keys(req.body).length === 0) {
       return res.status(400).json({
         success: false,
@@ -1678,57 +1667,13 @@ async function handlePushNotification(req, res) {
       });
     }
 
-    // 1) Get Google OAuth2 Access Token
-    const client = await fcmAuth.getClient();
-    const tokenRes = await client.getAccessToken();
-    const accessToken = typeof tokenRes === 'string' ? tokenRes : (tokenRes && tokenRes.token ? tokenRes.token : null);
-
-    if (!accessToken) {
-      return res.status(500).json({
-        success: false,
-        message: 'Could not obtain FCM OAuth2 access token.',
-      });
-    }
-
-    // 2) Payload directly as posted (wrapped in message if not already wrapped)
-    const payload = req.body.message ? req.body : { message: req.body };
-
-    // 3) Send payload to FCM HTTP v1
-    const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-    const fcmRes = await fetch(fcmUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const fcmData = await fcmRes.json();
-    console.log('[FCM v1] Response:', fcmRes.status, fcmData);
-
-    if (fcmRes.ok) {
-      return res.status(200).json({
-        success: true,
-        message: 'Notification sent successfully',
-        message_id: fcmData.name,
-        response: fcmData,
-        sent_payload: payload,
-      });
-    } else {
-      return res.status(fcmRes.status).json({
-        success: false,
-        message: 'FCM HTTP v1 error',
-        error: fcmData.error || fcmData,
-        sent_payload: payload,
-      });
-    }
+    const result = await sendFcmNotification(req.body);
+    return res.status(result.success ? 200 : (result.status || 500)).json(result);
   } catch (error) {
     console.error('[FCM v1] Error:', error.message);
     return res.status(500).json({
       success: false,
-      message: 'Internal server error while sending push notification',
-      error: error.message,
+      message: error.message || 'Internal server error while sending push notification',
     });
   }
 }
