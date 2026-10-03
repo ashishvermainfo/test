@@ -1557,7 +1557,7 @@ async function sendFcmNotification(payload = {}) {
   return {
     success: fcmRes.ok,
     status: fcmRes.status,
-    topic,
+    topic: singleTopic,
     message_id: fcmData.name,
     response: fcmData,
     sent_payload: { message },
