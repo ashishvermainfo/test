@@ -1435,42 +1435,68 @@ async function sendFcmNotification(payload = {}) {
   }
 
   // 2) Extract base message object (as sent by caller)
-  const baseMessage = payload.message ? { ...payload.message } : { ...payload };
+  let baseMessage = payload.message ? { ...payload.message } : { ...payload };
+  delete baseMessage.items;
+  delete baseMessage.sms_body;
+  delete baseMessage.phones;
+  delete baseMessage.users;
+  delete baseMessage.carts;
 
-  // 3) Inspect topic
-  const rawTopic = baseMessage.topic || payload.topic;
-
-  let phoneList = [];
-  if (Array.isArray(rawTopic)) {
-    phoneList = rawTopic;
-  } else if (typeof rawTopic === 'string' && rawTopic.includes(',')) {
-    phoneList = rawTopic.split(',');
-  } else if (Array.isArray(payload.items) && rawTopic !== 'all') {
-    phoneList = payload.items.map((it) => it.customer_no || it.customer_phone || it.mobile || it.phone || '');
+  // 3) Inspect topic from all possible fields
+  let topicList = [];
+  if (Array.isArray(payload.topic)) {
+    topicList.push(...payload.topic);
+  }
+  if (Array.isArray(baseMessage.topic)) {
+    topicList.push(...baseMessage.topic);
+  }
+  if (Array.isArray(payload.topics)) {
+    topicList.push(...payload.topics);
+  }
+  if (Array.isArray(payload.phones)) {
+    topicList.push(...payload.phones);
+  }
+  if (Array.isArray(payload.users)) {
+    topicList.push(...payload.users);
   }
 
-  // Clean 10-digit phone numbers
-  const targetPhones = new Set();
-  for (const p of phoneList) {
-    const clean = String(p || '').replace(/\D+/g, '').slice(-10);
-    if (clean.length === 10) {
-      targetPhones.add(clean);
+  const rawTopic = payload.topic || baseMessage.topic;
+  if (topicList.length === 0 && typeof rawTopic === 'string' && rawTopic.includes(',')) {
+    topicList.push(...rawTopic.split(','));
+  }
+
+  // If no topic array found but items exists and rawTopic is not explicitly 'all', extract from items
+  if (topicList.length === 0 && Array.isArray(payload.items) && rawTopic !== 'all') {
+    topicList.push(...payload.items.map((it) => it.customer_no || it.customer_phone || it.mobile || it.phone || ''));
+  }
+
+  // Deduplicate target topics and format as user_<10digits> if it's a phone number
+  const targetTopics = new Set();
+  for (const item of topicList) {
+    const str = String(item || '').trim();
+    if (!str || str.toLowerCase() === 'all') continue;
+
+    const digits = str.replace(/\D+/g, '').slice(-10);
+    if (digits.length === 10) {
+      targetTopics.add(`user_${digits}`);
+    } else {
+      targetTopics.add(str);
     }
   }
 
   const fcmUrl = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
 
-  // Case A: topic is array or comma-separated list of phone numbers -> send batch
-  if (targetPhones.size > 0) {
-    const phones = Array.from(targetPhones);
-    console.log(`[FCM v1] Sending batch to ${phones.length} phone topics in background...`);
+  // Case A: multiple topics provided (array or comma-separated list) -> send batch
+  if (targetTopics.size > 0) {
+    const topics = Array.from(targetTopics);
+    console.log(`[FCM v1] Sending batch to ${topics.length} topics in background:`, topics);
 
     const results = [];
     const BATCH_SIZE = 15;
-    for (let i = 0; i < phones.length; i += BATCH_SIZE) {
-      const chunk = phones.slice(i, i + BATCH_SIZE);
-      const promises = chunk.map(async (phone) => {
-        const message = { ...baseMessage, topic: phone };
+    for (let i = 0; i < topics.length; i += BATCH_SIZE) {
+      const chunk = topics.slice(i, i + BATCH_SIZE);
+      const promises = chunk.map(async (t) => {
+        const message = { ...baseMessage, topic: t };
         try {
           const res = await fetch(fcmUrl, {
             method: 'POST',
@@ -1481,9 +1507,13 @@ async function sendFcmNotification(payload = {}) {
             body: JSON.stringify({ message }),
           });
           const data = await res.json();
-          return { phone, ok: res.ok, status: res.status, data };
+          if (!res.ok) {
+            console.error(`[FCM v1] Error sending to topic ${t}:`, res.status, data);
+          }
+          return { topic: t, ok: res.ok, status: res.status, data };
         } catch (err) {
-          return { phone, ok: false, error: err.message };
+          console.error(`[FCM v1] Network error for topic ${t}:`, err.message);
+          return { topic: t, ok: false, error: err.message };
         }
       });
 
@@ -1492,20 +1522,25 @@ async function sendFcmNotification(payload = {}) {
     }
 
     const successCount = results.filter((r) => r.ok).length;
-    console.log(`[FCM v1] Sent ${successCount}/${phones.length} notifications`);
+    console.log(`[FCM v1] Sent ${successCount}/${topics.length} notifications`);
     return {
       success: successCount > 0,
       sent_count: successCount,
-      failed_count: phones.length - successCount,
-      total: phones.length,
+      failed_count: topics.length - successCount,
+      total: topics.length,
+      topics,
       results,
     };
   }
 
-  // Case B: topic is single string (e.g. 'all' or specific topic) -> send single FCM
-  const topic = (typeof rawTopic === 'string' && rawTopic.trim()) ? rawTopic.trim() : 'all';
-  const message = { ...baseMessage, topic };
-  console.log(`[FCM v1] Sending single notification to topic: ${topic}`);
+  // Case B: single string topic (e.g. 'all' or 'user_9027408729')
+  let singleTopic = (typeof rawTopic === 'string' && rawTopic.trim()) ? rawTopic.trim() : 'all';
+  if (singleTopic !== 'all' && !singleTopic.startsWith('user_') && /^\d{10}$/.test(singleTopic)) {
+    singleTopic = `user_${singleTopic}`;
+  }
+
+  const message = { ...baseMessage, topic: singleTopic };
+  console.log(`[FCM v1] Sending single notification to topic: ${singleTopic}`);
 
   const fcmRes = await fetch(fcmUrl, {
     method: 'POST',
