@@ -1488,7 +1488,7 @@ async function sendFcmNotification(payload = {}) {
       });
 
       const chunkResults = await Promise.all(promises);
-      results.push(...batchResults);
+      results.push(...chunkResults);
     }
 
     const successCount = results.filter((r) => r.ok).length;
