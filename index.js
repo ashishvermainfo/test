@@ -480,6 +480,193 @@ app.post('/xpressbee-tracking', (req, res) => {
   runInBackground(xpressbeeTrackingJob(ordersIn));
 });
 
+// ==================== Ekart Tracking ====================
+const WP_EKART_HOOK = process.env.WP_EKART_HOOK || 'https://api.restinfoot.com/webhook/ekart-hook.php';
+
+let cachedEkartToken = null;
+let cachedEkartTokenExpiry = 0;
+
+async function getEkartToken(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedEkartToken && cachedEkartTokenExpiry > now) {
+    return cachedEkartToken;
+  }
+  const res = await fetch('https://staging.ekartlogistics.com/auth/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'HTTP_X_MERCHANT_CODE': 'FOT',
+      'Authorization': 'Basic cmVzdGluZm9vdHNmb3Q6ZHVtbXlLZXk=',
+    },
+    body: '',
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Ekart token error HTTP ${res.status}: ${text}`);
+  }
+  const data = await res.json().catch(() => null);
+  let token = (data && (data.Authorization || data.accessToken || data.token)) || '';
+  if (!token) {
+    throw new Error('Ekart auth token not found in response');
+  }
+  cachedEkartToken = token;
+  // Cache for 6 hours
+  cachedEkartTokenExpiry = now + 6 * 60 * 60 * 1000;
+  return token;
+}
+
+async function ekartFetchTracking(trackingIds) {
+  if (!Array.isArray(trackingIds) || !trackingIds.length) return {};
+
+  let token = await getEkartToken();
+  const makeRequest = async (authToken) => {
+    const authHeader = authToken.startsWith('Bearer ') || authToken.startsWith('Basic ')
+      ? authToken
+      : `Bearer ${authToken}`;
+    return await fetch('https://api.ekartlogistics.com/shipments/large/track', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'HTTP_X_MERCHANT_CODE': 'FOT',
+        'Authorization': authHeader,
+      },
+      body: JSON.stringify({ tracking_ids: trackingIds }),
+    });
+  };
+
+  let res = await makeRequest(token);
+  if (res.status === 401 || res.status === 403) {
+    console.log('[ekart-tracking] token expired/invalid, refreshing...');
+    token = await getEkartToken(true);
+    res = await makeRequest(token);
+  }
+
+  const raw = await res.text();
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`HTTP ${res.status}: ${raw.slice(0, 200)}`);
+  }
+
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    throw new Error('Invalid JSON from Ekart tracking API');
+  }
+}
+
+async function ekartTrackingJob(ordersIn) {
+  console.log('[ekart-tracking] start orders=', ordersIn.length);
+  const out = [];
+
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    const orderId = String(row.order_id || '').trim();
+
+    let awbs = [];
+    if (Array.isArray(row.awb)) {
+      awbs = row.awb;
+    } else if (Array.isArray(row.awbs)) {
+      awbs = row.awbs;
+    } else if (typeof row.awb === 'string') {
+      awbs = row.awb.split(',');
+    } else if (typeof row.awbs === 'string') {
+      awbs = row.awbs.split(',');
+    }
+    awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+    if (!orderId || !awbs.length) continue;
+
+    const awbResults = [];
+    try {
+      const trackDataMap = await ekartFetchTracking(awbs);
+      for (const awb of awbs) {
+        const item = trackDataMap[awb] || trackDataMap[awb.toUpperCase()] || trackDataMap[awb.toLowerCase()] || null;
+        if (!item) {
+          awbResults.push({ awb, status: '', edd: '', error: 'AWB not found in Ekart tracking response' });
+          continue;
+        }
+
+        const status = String(item.status || '').trim();
+        let edd = '';
+        if (Array.isArray(item.shipments) && item.shipments.length > 0) {
+          edd = String(item.shipments[0].expected_delivery_date || item.shipments[0].expectedDeliveryDate || '').trim();
+        } else if (item.expected_delivery_date) {
+          edd = String(item.expected_delivery_date).trim();
+        }
+
+        awbResults.push({
+          awb,
+          status,
+          edd,
+          history: (Array.isArray(item.shipments) && item.shipments[0] && Array.isArray(item.shipments[0].history))
+            ? item.shipments[0].history
+            : [],
+        });
+      }
+    } catch (e) {
+      console.error('[ekart-tracking] error for order', orderId, e.message);
+      for (const awb of awbs) {
+        awbResults.push({ awb, status: '', edd: '', error: e.message || 'fetch failed' });
+      }
+    }
+
+    out.push({ order_id: orderId, awbs: awbResults });
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (!out.length) {
+    console.log('[ekart-tracking] nothing to post');
+    return out;
+  }
+
+  try {
+    const wpRes = await fetch(WP_EKART_HOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ orders: out }),
+    });
+    console.log('[ekart-tracking] WP hook status', wpRes.status, (await wpRes.text()).slice(0, 300));
+  } catch (err) {
+    console.log('[ekart-tracking] WP hook notice:', err.message);
+  }
+
+  return out;
+}
+
+app.post(['/ekart-tracking', '/ekart_tracking'], async (req, res) => {
+  const body = req.body || {};
+  let ordersIn = Array.isArray(body.orders) ? body.orders : [];
+  if (!ordersIn.length && (body.tracking_ids || body.awb || body.awbs)) {
+    const singleAwbs = Array.isArray(body.tracking_ids)
+      ? body.tracking_ids
+      : (body.awb || body.awbs);
+    ordersIn = [{ order_id: body.order_id || 'manual', awb: singleAwbs }];
+  }
+
+  const isSync = Boolean(body.sync || req.query.sync === '1' || req.query.sync === 'true');
+
+  if (isSync) {
+    try {
+      const out = await ekartTrackingJob(ordersIn);
+      return res.status(200).json({
+        success: true,
+        count: out.length,
+        orders: out,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err.message,
+      });
+    }
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+  });
+  runInBackground(ekartTrackingJob(ordersIn));
+});
+
 const WP_SEND_MAIL_HOOK = 'https://api.restinfoot.com/webhook/send-mail-hook.php';
 const MAIL_FROM_NAME = 'vivek agarwal';
 
