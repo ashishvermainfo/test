@@ -480,6 +480,110 @@ app.post('/xpressbee-tracking', (req, res) => {
   runInBackground(xpressbeeTrackingJob(ordersIn));
 });
 
+// ==================== TCI Express Tracking ====================
+const WP_TCI_HOOK = process.env.WP_TCI_HOOK || 'https://api.restinfoot.com/webhook/tci-hook.php';
+
+async function tciFetchAwb(awb) {
+  const cleanAwb = String(awb || '').trim();
+  const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <getConsignmentResponseMessage xmlns="http://www.tciexpress.in/">
+      <pConsignmentNumber>${cleanAwb}</pConsignmentNumber>
+      <pUserProfile>
+        <UserID>BTFPA1335M</UserID>
+        <Password>WRV90YK</Password>
+      </pUserProfile>
+    </getConsignmentResponseMessage>
+  </soap:Body>
+</soap:Envelope>`;
+
+  const res = await fetch('https://customerapi.tciexpress.in/ServiceEnquire.asmx', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction': 'http://www.tciexpress.in/getConsignmentResponseMessage',
+    },
+    body: xmlRequest,
+  });
+
+  const xmlText = await res.text();
+  if (!res.ok || !xmlText) {
+    return { awb: cleanAwb, status: '', event_code: '', event_description: '', error: 'HTTP ' + res.status };
+  }
+
+  // Parse <Consignment ... /> attributes
+  const match = xmlText.match(/<Consignment\s+([^>]+)\/?>/i);
+  if (!match) {
+    return { awb: cleanAwb, status: '', event_code: '', event_description: '', error: 'Consignment not found' };
+  }
+
+  const attrStr = match[1];
+  const attrs = {};
+  const attrRegex = /([a-zA-Z0-9_:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = attrRegex.exec(attrStr)) !== null) {
+    attrs[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  }
+
+  const eventCode = String(attrs.LastEventCode || '').trim();
+  const eventDesc = String(attrs.LastEventDescription || '').trim();
+  const edd = String(attrs.ExpectedDeliveryDate || attrs.EDD || attrs.DeliveryDate || '').trim();
+
+  return {
+    awb: cleanAwb,
+    status: eventCode,
+    event_code: eventCode,
+    event_description: eventDesc,
+    edd: edd,
+  };
+}
+
+async function tciTrackingJob(ordersIn) {
+  console.log('[tci-tracking] bg start orders=', ordersIn.length);
+  const out = [];
+  for (const row of ordersIn) {
+    if (!row || typeof row !== 'object') continue;
+    const orderId = String(row.order_id || '').trim();
+    let awbs = Array.isArray(row.awb) ? row.awb : Array.isArray(row.awbs) ? row.awbs : [];
+    awbs = awbs.map((a) => String(a || '').trim()).filter(Boolean);
+    if (!orderId || !awbs.length) continue;
+
+    const awbResults = [];
+    for (const awb of awbs) {
+      try {
+        awbResults.push(await tciFetchAwb(awb));
+      } catch (e) {
+        awbResults.push({ awb, status: '', event_code: '', event_description: '', error: e.message || 'fetch failed' });
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    out.push({ order_id: orderId, awbs: awbResults });
+  }
+
+  if (!out.length) {
+    console.log('[tci-tracking] bg nothing to post');
+    return;
+  }
+
+  const wpRes = await fetch(WP_TCI_HOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ orders: out }),
+  });
+  console.log('[tci-tracking] bg done tracked=', out.length, 'wp', wpRes.status, (await wpRes.text()).slice(0, 300));
+}
+
+app.post(['/tci-tracking', '/tci_tracking'], (req, res) => {
+  const ordersIn = Array.isArray((req.body || {}).orders) ? req.body.orders : [];
+  res.status(200).json({
+    success: true,
+    message: 'accepted',
+    count: ordersIn.length,
+  });
+  runInBackground(tciTrackingJob(ordersIn));
+});
+
 // ==================== Ekart Tracking ====================
 const WP_EKART_HOOK = process.env.WP_EKART_HOOK || 'https://api.restinfoot.com/webhook/ekart-hook.php';
 
